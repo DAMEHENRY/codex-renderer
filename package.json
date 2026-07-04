@@ -1,0 +1,20 @@
+{
+  "name": "codex-renderer",
+  "version": "1.0.0",
+  "description": "Thin Obsidian renderer for the official Codex CLI",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production",
+    "build:test": "node esbuild.config.mjs test",
+    "test": "npm run build:test && node tests/pure-logic.test.cjs",
+    "smoke": "npm run build && node tests/main-load-smoke.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.20.0",
+    "obsidian": "latest",
+    "typescript": "^5.3.0"
+  }
+}

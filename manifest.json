@@ -1,0 +1,9 @@
+{
+  "id": "codex-renderer",
+  "name": "Codex Renderer",
+  "version": "1.0.0",
+  "minAppVersion": "1.7.0",
+  "description": "Thin Obsidian renderer for the official Codex CLI. Uses local ChatGPT subscription auth—no API keys. Official Codex history is the source of truth.",
+  "author": "Henry",
+  "isDesktopOnly": true
+}
