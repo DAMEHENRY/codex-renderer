@@ -1567,6 +1567,7 @@ class CodexChatView extends ItemView {
     const assistantIdx = this.messages.length - 1;
     const assistantWrapper = this.appendMessageEl(assistantMsg, assistantIdx);
     const assistantContent = this.getMessageContentEl(assistantWrapper);
+    this.scrollToBottom();
 
     // Prepare image paths for -i flag
     const imagePaths = allChips
@@ -1578,6 +1579,7 @@ class CodexChatView extends ItemView {
     this.setStreamingUI(true);
     this.showStatus("Thinking…");
     this.inputEl.focus();
+    this.scrollToBottom();
 
     // Resolve vault root
     const vaultRoot = (this.app.vault.adapter as any).basePath || "";
