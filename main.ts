@@ -212,9 +212,10 @@ class HistoryStore {
 /*  Markdown Render Queue                                             */
 /* ================================================================== */
 
-const renderVersionMap = new WeakMap<HTMLElement, number>();
+const renderStateMap = new WeakMap<HTMLElement, { version: number; token: number }>();
 const renderQueue: Array<() => Promise<void>> = [];
 let renderRunning = false;
+let renderTokenCounter = 0;
 
 function enqueueRender(
   md: string,
@@ -223,16 +224,20 @@ function enqueueRender(
   app: App,
   version: number,
 ): void {
-  renderVersionMap.set(el, version);
+  const token = ++renderTokenCounter;
+  renderStateMap.set(el, { version, token });
   renderQueue.push(async () => {
-    if (renderVersionMap.get(el) !== version) return;
+    const state = renderStateMap.get(el);
+    if (!state || state.version !== version || state.token !== token) return;
     try {
       el.innerHTML = "";
       await MarkdownRenderer.render(app, md, el, sourcePath, undefined as any);
-      if (renderVersionMap.get(el) !== version) return;
+      const latestState = renderStateMap.get(el);
+      if (!latestState || latestState.version !== version || latestState.token !== token) return;
       postProcessWikilinks(el, app);
     } catch {
-      if (renderVersionMap.get(el) === version) {
+      const latestState = renderStateMap.get(el);
+      if (latestState && latestState.version === version && latestState.token === token) {
         el.setText(md);
       }
     }
@@ -761,6 +766,7 @@ class CodexChatView extends ItemView {
   private plugin: CodexRendererPlugin;
 
   // DOM elements
+  private wrapperEl!: HTMLDivElement;
   private chatEl!: HTMLDivElement;
   private welcomeEl!: HTMLDivElement;
   private chipsEl!: HTMLDivElement;
@@ -818,6 +824,7 @@ class CodexChatView extends ItemView {
     container.addClass("codex-renderer-view");
 
     const wrapper = container.createDiv({ cls: "cx-wrapper" });
+    this.wrapperEl = wrapper;
 
     // Chat area
     const chatFrame = wrapper.createDiv({ cls: "cx-chat-frame" });
@@ -861,7 +868,7 @@ class CodexChatView extends ItemView {
 
     // Mention dropdown
     this.mentionDropdown = inputArea.createDiv({ cls: "cx-mention-dropdown" });
-    this.mentionDropdown.style.display = "none";
+    this.setMentionDropdownVisible(false);
 
     // Unified composer toolbar row
     const toolbar = inputArea.createDiv({ cls: "cx-composer-toolbar" });
@@ -903,6 +910,7 @@ class CodexChatView extends ItemView {
     this.effortSelect.addEventListener("change", () => {
       this.plugin.settings.reasoningEffort = this.effortSelect.value;
       this.plugin.saveSettings();
+      this.updateOptionButtonLabels();
       this.closeOptionMenus();
     });
 
@@ -1011,7 +1019,7 @@ class CodexChatView extends ItemView {
     }
 
     this.mentionDropdown.empty();
-    this.mentionDropdown.style.display = "block";
+    this.setMentionDropdownVisible(true);
 
     for (let i = 0; i < this.mentionResults.length; i++) {
       const f = this.mentionResults[i];
@@ -1027,8 +1035,13 @@ class CodexChatView extends ItemView {
 
   private closeMentionDropdown(): void {
     this.mentionActive = false;
-    this.mentionDropdown.style.display = "none";
+    this.setMentionDropdownVisible(false);
     this.mentionDropdown.empty();
+  }
+
+  private setMentionDropdownVisible(visible: boolean): void {
+    this.mentionDropdown.style.display = visible ? "block" : "none";
+    this.wrapperEl.classList.toggle("is-mention-open", visible);
   }
 
   private selectMention(index: number): void {
@@ -1091,6 +1104,7 @@ class CodexChatView extends ItemView {
     // Send on Enter (without Shift)
     if (evt.key === "Enter" && !evt.shiftKey) {
       evt.preventDefault();
+      if (this.isStreaming) return;
       this.handleSend();
     }
   }
@@ -1186,11 +1200,8 @@ class CodexChatView extends ItemView {
       return;
     }
 
-    const startContent = this.closestMessageContent(range.startContainer);
-    const endContent = this.closestMessageContent(range.endContainer);
-    const commonContent = this.closestMessageContent(range.commonAncestorContainer);
-    const content = startContent && startContent === endContent ? startContent : commonContent;
-    if (!content || (startContent && startContent !== content) || (endContent && endContent !== content)) {
+    const content = this.selectedMessageContent(range);
+    if (!content) {
       this.hideQuotePopover();
       return;
     }
@@ -1220,6 +1231,30 @@ class CodexChatView extends ItemView {
     };
 
     this.showQuotePopover(rect);
+  }
+
+  private selectedMessageContent(range: Range): HTMLElement | null {
+    const intersectedContents = Array.from(
+      this.chatEl.querySelectorAll<HTMLElement>(".cx-message-content"),
+    ).filter((content) => {
+      try {
+        return range.intersectsNode(content);
+      } catch {
+        return false;
+      }
+    });
+
+    if (intersectedContents.length === 1) return intersectedContents[0];
+    if (intersectedContents.length > 1) return null;
+
+    const directContents = [
+      this.closestMessageContent(range.startContainer),
+      this.closestMessageContent(range.endContainer),
+      this.closestMessageContent(range.commonAncestorContainer),
+    ].filter((el): el is HTMLElement => !!el);
+
+    const uniqueDirectContents = Array.from(new Set(directContents));
+    return uniqueDirectContents.length === 1 ? uniqueDirectContents[0] : null;
   }
 
   private closestMessageContent(node: Node | null): HTMLElement | null {
@@ -1530,7 +1565,8 @@ class CodexChatView extends ItemView {
     };
     this.messages.push(assistantMsg);
     const assistantIdx = this.messages.length - 1;
-    const assistantEl = this.appendMessageEl(assistantMsg, assistantIdx);
+    const assistantWrapper = this.appendMessageEl(assistantMsg, assistantIdx);
+    const assistantContent = this.getMessageContentEl(assistantWrapper);
 
     // Prepare image paths for -i flag
     const imagePaths = allChips
@@ -1541,6 +1577,7 @@ class CodexChatView extends ItemView {
     this.isStreaming = true;
     this.setStreamingUI(true);
     this.showStatus("Thinking…");
+    this.inputEl.focus();
 
     // Resolve vault root
     const vaultRoot = (this.app.vault.adapter as any).basePath || "";
@@ -1580,7 +1617,7 @@ class CodexChatView extends ItemView {
             accumulatedText += evt.content;
             assistantMsg.content = accumulatedText;
             assistantMsg.displayContent = accumulatedText;
-            this.renderAssistantMessage(assistantEl, accumulatedText, version);
+            this.renderAssistantMessage(assistantContent, accumulatedText, version);
             this.scrollToBottom();
             break;
 
@@ -1598,14 +1635,14 @@ class CodexChatView extends ItemView {
             accumulatedText += `\n\n> ⚠️ ${evt.content}`;
             assistantMsg.content = accumulatedText;
             assistantMsg.displayContent = accumulatedText;
-            this.renderAssistantMessage(assistantEl, accumulatedText, version);
+            this.renderAssistantMessage(assistantContent, accumulatedText, version);
             break;
 
           case "cancelled":
             assistantMsg.sendStatus = "cancelled";
             if (accumulatedText) {
               assistantMsg.displayContent = appendPartialWarning(accumulatedText);
-              this.renderAssistantMessage(assistantEl, assistantMsg.displayContent, version);
+              this.renderAssistantMessage(assistantContent, assistantMsg.displayContent, version);
             }
             break;
 
@@ -1633,7 +1670,7 @@ class CodexChatView extends ItemView {
       accumulatedText += `\n\n> ⚠️ Error: ${errMsg}`;
       assistantMsg.content = accumulatedText;
       assistantMsg.displayContent = accumulatedText;
-      this.renderAssistantMessage(assistantEl, accumulatedText, version);
+      this.renderAssistantMessage(assistantContent, accumulatedText, version);
     } finally {
       this.isStreaming = false;
       this.setStreamingUI(false);
@@ -1796,6 +1833,14 @@ class CodexChatView extends ItemView {
     return wrapper;
   }
 
+  private getMessageContentEl(wrapper: HTMLDivElement): HTMLDivElement {
+    const existing = Array.from(wrapper.children).find((child): child is HTMLDivElement => {
+      return child instanceof HTMLDivElement && child.classList.contains("cx-message-content");
+    });
+    if (existing) return existing;
+    return wrapper.createDiv({ cls: "cx-message-content" });
+  }
+
   private renderAssistantMessage(el: HTMLDivElement, md: string, version: number): void {
     const sourcePath = this.app.workspace.getActiveFile()?.path || "";
     enqueueRender(md, el, sourcePath, this.app, version);
@@ -1819,7 +1864,7 @@ class CodexChatView extends ItemView {
   private setStreamingUI(streaming: boolean): void {
     this.sendBtn.style.display = streaming ? "none" : "";
     this.cancelBtn.style.display = streaming ? "" : "none";
-    this.inputEl.disabled = streaming;
+    this.inputEl.disabled = false;
     this.newChatBtn.disabled = streaming;
     this.modelMenuBtn.disabled = streaming;
     this.effortMenuBtn.disabled = streaming;

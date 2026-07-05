@@ -308,15 +308,18 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 8px 12px;
-  border-top: 1px solid color-mix(in srgb, var(--background-modifier-border) 50%, transparent);
-  background: color-mix(in srgb, var(--background-primary) 50%, var(--background-secondary));
+  padding: 0 2px;
+  margin: 8px 12px 0 12px;
+  border: none;
+  background: transparent;
+  box-shadow: none;
 }
 
 .cx-chip {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  max-width: 100%;
   background: color-mix(in srgb, var(--background-primary) 70%, var(--background-modifier-border));
   border: 1px solid color-mix(in srgb, var(--background-modifier-border) 60%, transparent);
   border-radius: 20px;
@@ -548,7 +551,7 @@
 .cx-status {
   position: relative;
   align-self: flex-start !important;
-  margin: 4px 14px -6px 14px !important;
+  margin: 4px 14px 0 14px !important;
   padding: 4px 10px !important;
   font-size: 11.5px !important;
   color: var(--text-muted) !important;
@@ -560,10 +563,15 @@
   text-overflow: ellipsis !important;
   box-shadow: none !important;
   width: fit-content !important;
+  max-width: calc(100% - 28px) !important;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   z-index: 5;
+}
+
+.cx-wrapper.is-mention-open .cx-status {
+  visibility: hidden;
 }
 
 /* ─── Input Area ───────────────────────────────────────────────────────── */
@@ -845,8 +853,13 @@
   color: var(--text-normal) !important;
 }
 
-.cx-new-chat-btn:focus,
-.cx-history-btn:focus {
+.cx-new-chat-btn:focus:not(:focus-visible),
+.cx-history-btn:focus:not(:focus-visible) {
+  outline: none !important;
+}
+
+.cx-new-chat-btn:focus-visible,
+.cx-history-btn:focus-visible {
   outline: 2px solid var(--chat-accent) !important;
   outline-offset: 1px !important;
 }
@@ -878,7 +891,7 @@
   border: 1px solid var(--background-modifier-border);
   border-radius: 6px;
   box-shadow: 0 -4px 12px rgba(0, 0, 0, 0.15);
-  z-index: 10;
+  z-index: 40;
 }
 
 .cx-mention-item {
