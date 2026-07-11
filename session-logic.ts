@@ -6,6 +6,7 @@
  */
 
 import { pathToFileURL } from "url";
+import { homedir } from "os";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                         */
@@ -29,6 +30,64 @@ export const EXTENSION_RANK: Record<string, number> = {
   ts: 6, js: 7, py: 8, yaml: 9, yml: 10, toml: 11,
 };
 
+export const CODEX_CHILD_PATH_PREPEND = [
+  "/Applications/ChatGPT.app/Contents/Resources",
+  "/Applications/Codex.app/Contents/Resources",
+  `${homedir()}/.cache/codex-runtimes/codex-primary-runtime/dependencies/bin`,
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/opt/homebrew/sbin",
+  "/usr/local/sbin",
+];
+
+export const CODEX_CLI_ABSOLUTE_FALLBACKS = [
+  "/Applications/ChatGPT.app/Contents/Resources/codex",
+  "/Applications/Codex.app/Contents/Resources/codex",
+  "/opt/homebrew/bin/codex",
+  "/usr/local/bin/codex",
+];
+
+export function buildCodexChildPath(basePath: string): string {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+
+  for (const entry of [...CODEX_CHILD_PATH_PREPEND, ...(basePath || "").split(":")]) {
+    const trimmed = entry.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    parts.push(trimmed);
+  }
+
+  return parts.join(":");
+}
+
+export function resolveExecutablePath(
+  configuredPath: string,
+  searchPath: string,
+  isExecutable: (candidate: string) => boolean,
+): { path: string | null; candidates: string[] } {
+  const configured = (configuredPath || "codex").trim();
+  const candidates: string[] = [];
+  const add = (candidate: string) => {
+    if (candidate && !candidates.includes(candidate)) candidates.push(candidate);
+  };
+
+  if (configured.includes("/")) {
+    add(configured);
+  } else {
+    for (const dir of (searchPath || "").split(":")) {
+      const trimmed = dir.trim().replace(/\/$/, "");
+      if (trimmed) add(`${trimmed}/${configured}`);
+    }
+  }
+  for (const fallback of CODEX_CLI_ABSOLUTE_FALLBACKS) add(fallback);
+
+  return {
+    path: candidates.find(isExecutable) || null,
+    candidates,
+  };
+}
+
 /* ------------------------------------------------------------------ */
 /*  Codex CLI argument builders                                       */
 /* ------------------------------------------------------------------ */
@@ -39,7 +98,7 @@ export const EXTENSION_RANK: Record<string, number> = {
  */
 export function buildReasoningEffortArg(effort: string): string[] {
   if (!effort || effort === "default") return [];
-  const valid = ["none", "minimal", "low", "medium", "high", "xhigh"];
+  const valid = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
   if (!valid.includes(effort)) return [];
   return ["-c", `model_reasoning_effort="${effort}"`];
 }
@@ -489,6 +548,24 @@ export interface ModelCatalogEntry {
   defaultReasoningLevel?: string;
 }
 
+export const CODEX_APP_ENABLED_REASONING_EFFORTS = ["low", "medium", "high", "xhigh", "ultra"];
+
+const EFFORT_DISPLAY_LABELS: Record<string, string> = {
+  default: "Default",
+  none: "None",
+  minimal: "Minimal",
+  low: "Light",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+  ultra: "Ultra",
+};
+
+export function getEffortDisplayLabel(effort: string): string {
+  return EFFORT_DISPLAY_LABELS[effort] || effort;
+}
+
 export function parseModelsJson(jsonStr: string): ModelCatalogEntry[] {
   try {
     const obj = JSON.parse(jsonStr);
@@ -515,21 +592,24 @@ export function parseModelsJson(jsonStr: string): ModelCatalogEntry[] {
 
 export function getFallbackModelCatalog(): ModelCatalogEntry[] {
   return [
-    { slug: "gpt-5.5", displayName: "GPT-5.5", supportedReasoningLevels: ["none", "low", "medium", "high", "xhigh"], defaultReasoningLevel: "medium" },
-    { slug: "gpt-5.4", displayName: "GPT-5.4", supportedReasoningLevels: ["none", "low", "medium", "high", "xhigh"], defaultReasoningLevel: "low" },
-    { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini", supportedReasoningLevels: ["none", "low", "medium", "high", "xhigh"], defaultReasoningLevel: "low" }
+    { slug: "gpt-5.6-sol", displayName: "GPT-5.6-Sol", supportedReasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], defaultReasoningLevel: "medium" },
+    { slug: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", supportedReasoningLevels: ["low", "medium", "high", "xhigh", "max", "ultra"], defaultReasoningLevel: "medium" },
+    { slug: "gpt-5.6-luna", displayName: "GPT-5.6-Luna", supportedReasoningLevels: ["low", "medium", "high", "xhigh", "max"], defaultReasoningLevel: "medium" },
+    { slug: "gpt-5.5", displayName: "GPT-5.5", supportedReasoningLevels: ["low", "medium", "high", "xhigh"], defaultReasoningLevel: "medium" },
+    { slug: "gpt-5.4", displayName: "GPT-5.4", supportedReasoningLevels: ["low", "medium", "high", "xhigh"], defaultReasoningLevel: "medium" },
+    { slug: "gpt-5.4-mini", displayName: "GPT-5.4-Mini", supportedReasoningLevels: ["low", "medium", "high", "xhigh"], defaultReasoningLevel: "medium" }
   ];
 }
 
 export function getEffortOptionsForModel(slug: string, catalog: ModelCatalogEntry[]): string[] {
   if (!slug) {
-    return ["default", "none", "minimal", "low", "medium", "high", "xhigh"];
+    return ["default"];
   }
   const model = (catalog || []).find((m) => m.slug === slug);
   if (!model) {
-    return ["default", "low", "medium", "high", "xhigh"];
+    return ["default"];
   }
-  return ["default", ...model.supportedReasoningLevels];
+  return model.supportedReasoningLevels.filter((effort) => CODEX_APP_ENABLED_REASONING_EFFORTS.includes(effort));
 }
 
 export function getImageOnlyPromptAndDisplay(hasImages: boolean, rawText: string): { prompt: string; displayContent: string; isImageOnly: boolean } {

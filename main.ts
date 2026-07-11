@@ -49,6 +49,7 @@ import {
   isSelectionInsideContainer,
   getFallbackModelCatalog,
   getEffortOptionsForModel,
+  getEffortDisplayLabel,
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
   type ContextChip,
@@ -85,7 +86,7 @@ export interface CodexRendererSettings {
 
 const DEFAULT_SETTINGS: CodexRendererSettings = {
   codexCliPath: "codex",
-  modelPresets: ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+  modelPresets: getFallbackModelCatalog().map((m) => m.slug),
   modelCatalog: getFallbackModelCatalog(),
   selectedModel: "",
   reasoningEffort: "default",
@@ -341,6 +342,7 @@ function formatRelativeDate(ts: number): string {
 export default class CodexRendererPlugin extends Plugin {
   settings!: CodexRendererSettings;
   historyStore!: HistoryStore;
+  private freshChatLeaves = new WeakSet<WorkspaceLeaf>();
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -357,14 +359,21 @@ export default class CodexRendererPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE, (leaf) => new CodexChatView(leaf, this));
 
-    this.addRibbonIcon(VIEW_ICON, "Open Codex Chat", () => {
-      this.activateView();
+    const ribbonEl = this.addRibbonIcon(VIEW_ICON, "Open New Codex Chat Window", () => {
+      this.activateNewView();
     });
+    ribbonEl.setAttribute("aria-label", "Open New Codex Chat Window");
 
     this.addCommand({
       id: "open-codex-chat",
       name: "Open Codex Chat",
       callback: () => this.activateView(),
+    });
+
+    this.addCommand({
+      id: "open-new-codex-chat-window",
+      name: "Open New Codex Chat Window",
+      callback: () => this.activateNewView(),
     });
 
     this.addSettingTab(new CodexRendererSettingTab(this.app, this));
@@ -425,6 +434,30 @@ export default class CodexRendererPlugin extends Plugin {
       if (leaf) leaf.setViewState({ type: VIEW_TYPE, active: true });
     }
     if (leaf) workspace.revealLeaf(leaf);
+  }
+
+  async activateNewView(): Promise<void> {
+    const { workspace } = this.app;
+    let leaf: WorkspaceLeaf | null = null;
+    try {
+      leaf = workspace.getRightLeaf(true);
+    } catch {}
+    if (!leaf) leaf = workspace.getLeaf("tab");
+    if (!leaf) return;
+
+    this.freshChatLeaves.add(leaf);
+    await leaf.setViewState({
+      type: VIEW_TYPE,
+      active: true,
+      state: { freshChat: true },
+    });
+    workspace.revealLeaf(leaf);
+  }
+
+  consumeFreshChatLeaf(leaf: WorkspaceLeaf): boolean {
+    const isFresh = this.freshChatLeaves.has(leaf);
+    if (isFresh) this.freshChatLeaves.delete(leaf);
+    return isFresh;
   }
 }
 
@@ -535,15 +568,12 @@ class CodexRendererSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Reasoning effort")
-      .setDesc("Override model_reasoning_effort. 'Default' uses Codex config.")
+      .setDesc("Override model_reasoning_effort using the same labels as the ChatGPT Codex UI. 'Use Codex default' passes no override.")
       .addDropdown((d) => {
-        d.addOption("default", "Default");
-        d.addOption("none", "none");
-        d.addOption("minimal", "minimal");
-        d.addOption("low", "low");
-        d.addOption("medium", "medium");
-        d.addOption("high", "high");
-        d.addOption("xhigh", "xhigh");
+        d.addOption("default", "Use Codex default");
+        for (const effort of ["low", "medium", "high", "xhigh", "ultra"]) {
+          d.addOption(effort, getEffortDisplayLabel(effort));
+        }
         d.setValue(this.plugin.settings.reasoningEffort);
         d.onChange(async (v) => {
           this.plugin.settings.reasoningEffort = v;
@@ -800,10 +830,12 @@ class CodexChatView extends ItemView {
   private selectionInterval: ReturnType<typeof setInterval> | null = null;
   private pendingQuote: ContextChip | null = null;
   private quoteSelectionTimer: number | null = null;
+  private skipInitialRestore: boolean;
 
   constructor(leaf: WorkspaceLeaf, plugin: CodexRendererPlugin) {
     super(leaf);
     this.plugin = plugin;
+    this.skipInitialRestore = plugin.consumeFreshChatLeaf(leaf);
   }
 
   getViewType(): string {
@@ -963,10 +995,12 @@ class CodexChatView extends ItemView {
     // Selection polling
     this.selectionInterval = setInterval(() => this.pollEditorSelection(), SELECTION_POLL_MS);
 
-    // Restore latest conversation if exists
-    const conversations = this.plugin.historyStore.getConversations();
-    if (conversations.length > 0) {
-      this.restoreConversation(conversations[0]);
+    // Restore latest conversation unless this leaf was explicitly opened as a fresh chat.
+    if (!this.skipInitialRestore) {
+      const conversations = this.plugin.historyStore.getConversations();
+      if (conversations.length > 0) {
+        this.restoreConversation(conversations[0]);
+      }
     }
   }
 
@@ -1977,12 +2011,14 @@ class CodexChatView extends ItemView {
     const currentVal = this.effortSelect.value || this.plugin.settings.reasoningEffort;
     this.effortSelect.empty();
     for (const e of effortOptions) {
-      this.effortSelect.createEl("option", { value: e, text: e === "default" ? "Effort: Default" : `Effort: ${e}` });
+      this.effortSelect.createEl("option", { value: e, text: `Effort: ${getEffortDisplayLabel(e)}` });
     }
     if (effortOptions.includes(currentVal)) {
       this.effortSelect.value = currentVal;
     } else {
-      this.effortSelect.value = "default";
+      const model = catalog.find((entry: any) => entry.slug === currentModel);
+      const fallback = model?.defaultReasoningLevel;
+      this.effortSelect.value = effortOptions.includes(fallback) ? fallback : effortOptions[0] || "default";
     }
     this.renderEffortMenu();
     this.updateOptionButtonLabels();

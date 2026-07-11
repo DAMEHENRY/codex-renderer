@@ -9,6 +9,10 @@ const {
   buildApprovalArg,
   buildImageArgs,
   buildCodexExecArgs,
+  buildCodexChildPath,
+  CODEX_CHILD_PATH_PREPEND,
+  CODEX_CLI_ABSOLUTE_FALLBACKS,
+  resolveExecutablePath,
   parseCodexJsonlLine,
   looksLikeInvalidResume,
   classifyFinalStatus,
@@ -25,6 +29,8 @@ const {
   parseModelsJson,
   getFallbackModelCatalog,
   getEffortOptionsForModel,
+  getEffortDisplayLabel,
+  CODEX_APP_ENABLED_REASONING_EFFORTS,
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
 } = require("./session-logic-bundle.cjs");
@@ -58,6 +64,8 @@ assertDeepEqual(buildReasoningEffortArg(""), [], "reasoning effort empty");
 assertDeepEqual(buildReasoningEffortArg("invalid"), [], "reasoning effort invalid");
 assertDeepEqual(buildReasoningEffortArg("low"), ["-c", 'model_reasoning_effort="low"'], "reasoning effort low");
 assertDeepEqual(buildReasoningEffortArg("high"), ["-c", 'model_reasoning_effort="high"'], "reasoning effort high");
+assertDeepEqual(buildReasoningEffortArg("max"), ["-c", 'model_reasoning_effort="max"'], "reasoning effort max");
+assertDeepEqual(buildReasoningEffortArg("ultra"), ["-c", 'model_reasoning_effort="ultra"'], "reasoning effort ultra");
 
 // ─── buildModelArg ───────────────────────────────────────────────────────
 assertDeepEqual(buildModelArg("default"), [], "model default");
@@ -139,6 +147,45 @@ assertDeepEqual(buildImageArgs(["/path/to/img1.png", "/path/to/img2.jpg"]), ["-i
     "-",
   ];
   assertDeepEqual(buildCodexExecArgs(opts), expectedArgs, "buildCodexExecArgs resume ignores search, sandbox, vaultRoot, approval");
+}
+
+// ─── buildCodexChildPath ─────────────────────────────────────────────────
+{
+  const childPath = buildCodexChildPath("/usr/bin:/bin:/usr/sbin:/sbin");
+  const parts = childPath.split(":");
+  assertDeepEqual(parts.slice(0, CODEX_CHILD_PATH_PREPEND.length), CODEX_CHILD_PATH_PREPEND, "child PATH prepends Codex and Homebrew paths");
+  assert(parts.includes("/usr/bin"), "child PATH keeps original system path");
+}
+
+{
+  const childPath = buildCodexChildPath("/opt/homebrew/bin:/usr/bin:/opt/homebrew/bin:/bin");
+  const parts = childPath.split(":");
+  assert(parts.filter((p) => p === "/opt/homebrew/bin").length === 1, "child PATH removes duplicate Homebrew bin");
+  assert(parts.filter((p) => p === "/usr/bin").length === 1, "child PATH removes duplicate original entries");
+}
+
+{
+  const childPath = buildCodexChildPath("");
+  assertDeepEqual(childPath.split(":"), CODEX_CHILD_PATH_PREPEND, "child PATH works when base PATH is empty");
+}
+
+{
+  const executable = "/Applications/ChatGPT.app/Contents/Resources/codex";
+  const resolved = resolveExecutablePath("codex", "/usr/bin:/bin", (candidate) => candidate === executable);
+  assert(resolved.path === executable, "resolve executable uses ChatGPT app fallback");
+  assert(resolved.candidates.includes("/usr/bin/codex"), "resolve executable searches GUI PATH");
+}
+
+{
+  const executable = "/custom/codex";
+  const resolved = resolveExecutablePath(executable, "/usr/bin", (candidate) => candidate === executable);
+  assert(resolved.path === executable, "resolve executable honors configured absolute path");
+}
+
+{
+  const resolved = resolveExecutablePath("codex", "/usr/bin:/bin", () => false);
+  assert(resolved.path === null, "resolve executable reports missing CLI");
+  assertDeepEqual(resolved.candidates.slice(-CODEX_CLI_ABSOLUTE_FALLBACKS.length), CODEX_CLI_ABSOLUTE_FALLBACKS, "resolve executable reports all app fallbacks");
 }
 
 // ─── parseCodexJsonlLine ─────────────────────────────────────────────────
@@ -319,20 +366,22 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
 {
   const json = JSON.stringify({
     models: [
-      { slug: "model-1", display_name: "Model 1", visibility: "list", supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }] },
+      { slug: "model-1", display_name: "Model 1", visibility: "list", default_reasoning_level: "high", supported_reasoning_levels: [{ effort: "low" }, { effort: "max" }, { effort: "ultra" }] },
       { slug: "model-2", display_name: "Model 2", visibility: "hidden", supported_reasoning_levels: ["low"] }
     ]
   });
   const parsed = parseModelsJson(json);
   assert(parsed.length === 1, "parseModelsJson filters out non-list models");
   assert(parsed[0].slug === "model-1", "parseModelsJson parses slug");
-  assertDeepEqual(parsed[0].supportedReasoningLevels, ["low", "high"], "parseModelsJson maps supported reasoning levels");
+  assertDeepEqual(parsed[0].supportedReasoningLevels, ["low", "max", "ultra"], "parseModelsJson maps supported reasoning levels");
+  assert(parsed[0].defaultReasoningLevel === "high", "parseModelsJson maps default reasoning level");
 }
 
 // ─── getFallbackModelCatalog ──────────────────────────────────────────────
 {
   const catalog = getFallbackModelCatalog();
-  assert(catalog.length === 3, "fallback catalog has 3 entries");
+  assert(catalog.length === 6, "fallback catalog has current offline entries");
+  assert(catalog.some(m => m.slug === "gpt-5.6-sol"), "fallback has gpt-5.6-sol");
   assert(catalog.some(m => m.slug === "gpt-5.5"), "fallback has gpt-5.5");
   assert(catalog.some(m => m.slug === "gpt-5.4"), "fallback has gpt-5.4");
   assert(catalog.some(m => m.slug === "gpt-5.4-mini"), "fallback has gpt-5.4-mini");
@@ -341,11 +390,15 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
 // ─── getEffortOptionsForModel ─────────────────────────────────────────────
 {
   const catalog = [
-    { slug: "model-1", displayName: "M1", supportedReasoningLevels: ["low", "medium"] }
+    { slug: "model-1", displayName: "M1", supportedReasoningLevels: ["none", "low", "medium", "xhigh", "max", "ultra"] }
   ];
-  assertDeepEqual(getEffortOptionsForModel("", catalog), ["default", "none", "minimal", "low", "medium", "high", "xhigh"], "empty slug effort options");
-  assertDeepEqual(getEffortOptionsForModel("model-1", catalog), ["default", "low", "medium"], "found model effort options");
-  assertDeepEqual(getEffortOptionsForModel("unknown", catalog), ["default", "low", "medium", "high", "xhigh"], "unknown model effort options");
+  assertDeepEqual(getEffortOptionsForModel("", catalog), ["default"], "default model does not guess effort options");
+  assertDeepEqual(getEffortOptionsForModel("model-1", catalog), ["low", "medium", "xhigh", "ultra"], "model efforts match Codex app enabled levels");
+  assertDeepEqual(getEffortOptionsForModel("unknown", catalog), ["default"], "unknown model does not guess effort options");
+  assertDeepEqual(CODEX_APP_ENABLED_REASONING_EFFORTS, ["low", "medium", "high", "xhigh", "ultra"], "Codex app effort order");
+  assert(getEffortDisplayLabel("low") === "Light", "low displays as Light");
+  assert(getEffortDisplayLabel("xhigh") === "Extra High", "xhigh displays as Extra High");
+  assert(getEffortDisplayLabel("ultra") === "Ultra", "ultra displays as Ultra");
 }
 
 // ─── getImageOnlyPromptAndDisplay ──────────────────────────────────────────
