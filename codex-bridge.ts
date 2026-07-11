@@ -10,6 +10,8 @@ import * as fs from "fs";
 import * as path from "path";
 import {
   buildCodexExecArgs,
+  buildCodexChildPath,
+  resolveExecutablePath,
   parseCodexJsonlLine,
   classifyFinalStatus,
   parseModelsJson,
@@ -69,28 +71,25 @@ export type SendStatus =
 /*  CLI discovery                                                     */
 /* ------------------------------------------------------------------ */
 
-const CODEX_CLI_FALLBACK_PATHS = [
-  "codex",
-  "/opt/homebrew/bin/codex",
-  "/usr/local/bin/codex",
-  "/Applications/Codex.app/Contents/Resources/codex",
-];
+export function buildCodexChildEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...env,
+    PATH: buildCodexChildPath(env.PATH || ""),
+  };
+}
 
-export function resolveCodexPath(configuredPath: string): string {
-  const candidates = configuredPath
-    ? [configuredPath, ...CODEX_CLI_FALLBACK_PATHS]
-    : CODEX_CLI_FALLBACK_PATHS;
-
-  for (const candidate of candidates) {
+export function resolveCodexPath(configuredPath: string, env: NodeJS.ProcessEnv = process.env): string {
+  const childEnv = buildCodexChildEnv(env);
+  const result = resolveExecutablePath(configuredPath, childEnv.PATH || "", (candidate) => {
     try {
       fs.accessSync(candidate, fs.constants.X_OK);
-      return candidate;
+      return true;
     } catch {
-      // try next
+      return false;
     }
-  }
-  // Return configured or first fallback; spawn will fail with a clear error
-  return configuredPath || CODEX_CLI_FALLBACK_PATHS[0];
+  });
+  if (result.path) return result.path;
+  throw new Error(`Codex CLI not found. Checked: ${result.candidates.join(", ")}`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -135,7 +134,14 @@ export async function* sendPrompt(
   opts: SendPromptOpts,
   vaultRoot: string,
 ): AsyncGenerator<CodexStreamEvent> {
-  const codexPath = resolveCodexPath(settings.codexCliPath);
+  let codexPath: string;
+  try {
+    codexPath = resolveCodexPath(settings.codexCliPath);
+  } catch (err) {
+    yield { type: "error", content: err instanceof Error ? err.message : String(err) };
+    yield { type: "done", content: "" };
+    return;
+  }
   const args = buildCodexExecArgs({
     vaultRoot,
     sessionId: opts.sessionId,
@@ -154,7 +160,7 @@ export async function* sendPrompt(
     child = spawn(codexPath, args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: vaultRoot,
-      env: { ...process.env },
+      env: buildCodexChildEnv(),
     });
   } catch (err) {
     yield {
@@ -322,6 +328,8 @@ export async function* sendPrompt(
 
   child.on("error", (err) => {
     spawnFailed = true;
+    hasError = true;
+    errorMessage = err.message;
     pushEvent({
       type: "error",
       content: `Codex CLI spawn error: ${err.message}`,
@@ -397,11 +405,18 @@ export async function* sendPrompt(
  */
 export function fetchModelCatalog(codexCliPath: string): Promise<ModelCatalogEntry[]> {
   return new Promise((resolve) => {
-    const binPath = resolveCodexPath(codexCliPath);
-    exec(`"${binPath}" debug models`, (err, stdout) => {
+    let binPath: string;
+    try {
+      binPath = resolveCodexPath(codexCliPath);
+    } catch {
+      resolve([]);
+      return;
+    }
+    const execOptions = { env: buildCodexChildEnv() };
+    exec(`"${binPath}" debug models`, execOptions, (err, stdout) => {
       if (err) {
         // Fallback to bundled
-        exec(`"${binPath}" debug models --bundled`, (err2, stdout2) => {
+        exec(`"${binPath}" debug models --bundled`, execOptions, (err2, stdout2) => {
           if (err2) {
             resolve([]);
           } else {
@@ -412,7 +427,7 @@ export function fetchModelCatalog(codexCliPath: string): Promise<ModelCatalogEnt
         const parsed = parseModelsJson(stdout);
         if (parsed.length === 0) {
           // Fallback if parsing returned empty
-          exec(`"${binPath}" debug models --bundled`, (err2, stdout2) => {
+          exec(`"${binPath}" debug models --bundled`, execOptions, (err2, stdout2) => {
             if (err2) {
               resolve([]);
             } else {
