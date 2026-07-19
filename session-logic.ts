@@ -191,6 +191,157 @@ export function buildCodexExecArgs(opts: {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Markdown math normalization                                      */
+/* ------------------------------------------------------------------ */
+
+export interface NormalizedMathMarkdown {
+  markdown: string;
+  mathSources: string[];
+}
+
+/**
+ * Convert common LaTeX delimiters into the dollar-delimited form that
+ * Obsidian's MarkdownRenderer understands. Code spans/fences and unmatched
+ * delimiters are preserved verbatim. Sources remain in rendered document
+ * order so the UI can associate MathJax nodes with their original LaTeX.
+ */
+export function normalizeMathForObsidian(markdown: string): NormalizedMathMarkdown {
+  const mathSources: string[] = [];
+  let output = "";
+  let index = 0;
+  let atLineStart = true;
+  let fence: { char: "`" | "~"; length: number } | null = null;
+
+  while (index < markdown.length) {
+    if (atLineStart) {
+      const lineEnd = markdown.indexOf("\n", index);
+      const contentEnd = lineEnd === -1 ? markdown.length : lineEnd;
+      const line = markdown.slice(index, contentEnd);
+      const fenceRun = line.match(/^[ \t]{0,3}(`{3,}|~{3,})/);
+
+      if (fence) {
+        output += markdown.slice(index, lineEnd === -1 ? markdown.length : lineEnd + 1);
+        const closingRun = line.match(/^[ \t]{0,3}(`+|~+)[ \t]*$/);
+        if (closingRun && closingRun[1][0] === fence.char && closingRun[1].length >= fence.length) {
+          fence = null;
+        }
+        if (lineEnd === -1) break;
+        index = lineEnd + 1;
+        atLineStart = true;
+        continue;
+      }
+
+      if (fenceRun) {
+        fence = {
+          char: fenceRun[1][0] as "`" | "~",
+          length: fenceRun[1].length,
+        };
+        output += markdown.slice(index, lineEnd === -1 ? markdown.length : lineEnd + 1);
+        if (lineEnd === -1) break;
+        index = lineEnd + 1;
+        atLineStart = true;
+        continue;
+      }
+    }
+
+    if (markdown[index] === "`") {
+      const runLength = countRun(markdown, index, "`");
+      const delimiter = "`".repeat(runLength);
+      const closingIndex = markdown.indexOf(delimiter, index + runLength);
+      if (closingIndex !== -1) {
+        const end = closingIndex + runLength;
+        const raw = markdown.slice(index, end);
+        output += raw;
+        index = end;
+        atLineStart = raw.endsWith("\n");
+        continue;
+      }
+    }
+
+    const delimiter = mathDelimiterAt(markdown, index);
+    if (delimiter) {
+      const closingIndex = findClosingMathDelimiter(
+        markdown,
+        index + delimiter.open.length,
+        delimiter.close,
+        delimiter.allowNewlines,
+      );
+
+      if (closingIndex !== -1) {
+        const body = markdown.slice(index + delimiter.open.length, closingIndex);
+        const inlineDollarIsValid = delimiter.open !== "$" || (
+          body.length > 0 && !/^\s/.test(body) && !/\s$/.test(body)
+        );
+
+        if (inlineDollarIsValid) {
+          const canonical = delimiter.block ? `$$${body}$$` : `$${body}$`;
+          output += canonical;
+          mathSources.push(canonical);
+          index = closingIndex + delimiter.close.length;
+          atLineStart = canonical.endsWith("\n");
+          continue;
+        }
+      }
+    }
+
+    const char = markdown[index];
+    output += char;
+    index += 1;
+    atLineStart = char === "\n";
+  }
+
+  return { markdown: output, mathSources };
+}
+
+function countRun(text: string, start: number, char: string): number {
+  let length = 0;
+  while (text[start + length] === char) length += 1;
+  return length;
+}
+
+function isEscaped(text: string, index: number): boolean {
+  let slashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) {
+    slashes += 1;
+  }
+  return slashes % 2 === 1;
+}
+
+function mathDelimiterAt(
+  text: string,
+  index: number,
+): { open: string; close: string; block: boolean; allowNewlines: boolean } | null {
+  if (text.startsWith("\\[", index) && !isEscaped(text, index)) {
+    return { open: "\\[", close: "\\]", block: true, allowNewlines: true };
+  }
+  if (text.startsWith("\\(", index) && !isEscaped(text, index)) {
+    return { open: "\\(", close: "\\)", block: false, allowNewlines: false };
+  }
+  if (text.startsWith("$$", index) && !isEscaped(text, index)) {
+    return { open: "$$", close: "$$", block: true, allowNewlines: true };
+  }
+  if (text[index] === "$" && text[index + 1] !== "$" && !isEscaped(text, index)) {
+    return { open: "$", close: "$", block: false, allowNewlines: false };
+  }
+  return null;
+}
+
+function findClosingMathDelimiter(
+  text: string,
+  start: number,
+  delimiter: string,
+  allowNewlines: boolean,
+): number {
+  for (let index = start; index < text.length; index += 1) {
+    if (!allowNewlines && text[index] === "\n") return -1;
+    if (!text.startsWith(delimiter, index) || isEscaped(text, index)) continue;
+    if (delimiter === "$" && (text[index - 1] === "$" || text[index + 1] === "$")) continue;
+    return index;
+  }
+  return -1;
+}
+
+/* ------------------------------------------------------------------ */
 /*  Codex JSONL event parsing                                         */
 /* ------------------------------------------------------------------ */
 

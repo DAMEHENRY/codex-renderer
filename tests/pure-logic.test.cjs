@@ -33,6 +33,7 @@ const {
   CODEX_APP_ENABLED_REASONING_EFFORTS,
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
+  normalizeMathForObsidian,
 } = require("./session-logic-bundle.cjs");
 
 let passed = 0;
@@ -419,6 +420,43 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
   const urlStr = imageSrcForPath("/abs/path/img.png");
   assert(urlStr.startsWith("file://"), "converts path to file:// URL");
   assert(urlStr.includes("img.png"), "url includes filename");
+}
+
+// ─── normalizeMathForObsidian ─────────────────────────────────────────────
+{
+  const source = "Before\n\\[\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n\\]\nAfter";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown.includes("$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"), "normalizes bracketed block math");
+  assertDeepEqual(result.mathSources, ["$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"], "captures normalized block source");
+}
+
+{
+  const source = "Use \\(K=5\\), keep $x_t$, and show $$y_t=2$$.";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === "Use $K=5$, keep $x_t$, and show $$y_t=2$$.", "normalizes inline math and preserves dollar math");
+  assertDeepEqual(result.mathSources, ["$K=5$", "$x_t$", "$$y_t=2$$"], "captures math sources in document order");
+}
+
+{
+  const source = [
+    "```md",
+    "\\[not math\\] and $also_not_math$",
+    "```",
+    "Inline `\\(not math\\)` stays code.",
+    "~~~",
+    "$$not math$$",
+    "~~~",
+  ].join("\n");
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === source, "leaves fenced and inline code unchanged");
+  assertDeepEqual(result.mathSources, [], "does not capture math inside code");
+}
+
+{
+  const source = "Unmatched \\(K and \\[x stay unchanged; escaped \\$5 is money.";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === source, "leaves unmatched and escaped delimiters unchanged");
+  assertDeepEqual(result.mathSources, [], "does not capture unmatched delimiters");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
