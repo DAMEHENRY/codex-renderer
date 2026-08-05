@@ -5,8 +5,9 @@
  * deterministic and unit-testable from a CJS test bundle.
  */
 
-import { pathToFileURL } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { homedir } from "os";
+import { isAbsolute, relative, resolve, sep } from "path";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                         */
@@ -775,4 +776,42 @@ export function getImageOnlyPromptAndDisplay(hasImages: boolean, rawText: string
 
 export function imageSrcForPath(absPath: string): string {
   return pathToFileURL(absPath).href;
+}
+
+/**
+ * Recognize the narrow local-link shape emitted by Codex file citations.
+ *
+ * Only absolute Markdown paths inside the current vault are accepted. Web
+ * URLs, relative links, paths outside the vault, and non-Markdown files are
+ * intentionally left for Obsidian's normal renderer.
+ */
+export function vaultMarkdownPathFromHref(href: string, vaultRoot: string): string | null {
+  const raw = (href || "").trim();
+  if (!raw || !vaultRoot) return null;
+
+  let candidate: string;
+  try {
+    if (raw.startsWith("file://")) {
+      candidate = fileURLToPath(raw);
+    } else if (raw.startsWith("/")) {
+      candidate = raw;
+    } else {
+      return null;
+    }
+    candidate = decodeURIComponent(candidate);
+  } catch {
+    return null;
+  }
+
+  // Codex file citations may append a source line, e.g. "/note.md:9".
+  candidate = candidate.replace(/:(\d+)(?:-\d+)?$/, "");
+  if (!isAbsolute(candidate)) return null;
+
+  const root = resolve(vaultRoot);
+  const target = resolve(candidate);
+  const rel = relative(root, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  if (!rel.toLowerCase().endsWith(".md")) return null;
+
+  return rel.split(sep).join("/");
 }

@@ -53,6 +53,7 @@ import {
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
   normalizeMathForObsidian,
+  vaultMarkdownPathFromHref,
   type ContextChip,
 } from "./session-logic";
 
@@ -239,6 +240,7 @@ function enqueueRender(
       if (!latestState || latestState.version !== version || latestState.token !== token) return;
       attachMathSources(el, normalized.mathSources);
       postProcessWikilinks(el, app);
+      postProcessVaultMarkdownLinks(el, app);
     } catch {
       const latestState = renderStateMap.get(el);
       if (latestState && latestState.version === version && latestState.token === token) {
@@ -330,6 +332,37 @@ function postProcessWikilinks(el: HTMLElement, app: App): void {
       tn.parentNode?.replaceChild(frag, tn);
     }
   }
+}
+
+/**
+ * Convert only existing vault Markdown file citations into Obsidian links.
+ * External URLs and all other Markdown links remain untouched.
+ */
+function postProcessVaultMarkdownLinks(el: HTMLElement, app: App): void {
+  const vaultRoot = (app.vault.adapter as any)?.basePath;
+  if (!vaultRoot) return;
+
+  const anchors = el.querySelectorAll<HTMLAnchorElement>("a[href]");
+  anchors.forEach((anchor) => {
+    if (anchor.classList.contains("internal-link")) return;
+
+    const vaultPath = vaultMarkdownPathFromHref(anchor.getAttribute("href") || "", vaultRoot);
+    if (!vaultPath) return;
+
+    const file = app.vault.getAbstractFileByPath(vaultPath);
+    if (!(file instanceof TFile)) return;
+
+    anchor.classList.remove("external-link");
+    anchor.classList.add("internal-link", "cx-wikilink");
+    anchor.removeAttribute("target");
+    anchor.removeAttribute("rel");
+    anchor.setAttribute("data-href", vaultPath);
+    anchor.addEventListener("click", (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      app.workspace.openLinkText(vaultPath, "", "tab");
+    });
+  });
 }
 
 /* ================================================================== */

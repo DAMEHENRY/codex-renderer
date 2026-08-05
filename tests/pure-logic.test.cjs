@@ -34,6 +34,7 @@ const {
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
   normalizeMathForObsidian,
+  vaultMarkdownPathFromHref,
 } = require("./session-logic-bundle.cjs");
 
 let passed = 0;
@@ -428,6 +429,33 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
   const result = normalizeMathForObsidian(source);
   assert(result.markdown.includes("$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"), "normalizes bracketed block math");
   assertDeepEqual(result.mathSources, ["$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"], "captures normalized block source");
+}
+
+// ─── vaultMarkdownPathFromHref ────────────────────────────────────────────
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  const href = "/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
+  assert(
+    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    "converts absolute vault Markdown citation with line number",
+  );
+}
+
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  const href = "file:///Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
+  assert(
+    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    "converts file URL vault Markdown citation",
+  );
+}
+
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  assert(vaultMarkdownPathFromHref("https://example.com/note.md", vaultRoot) === null, "leaves web URLs untouched");
+  assert(vaultMarkdownPathFromHref("quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md", vaultRoot) === null, "leaves relative links untouched");
+  assert(vaultMarkdownPathFromHref("/Users/henry/outside/note.md:1", vaultRoot) === null, "leaves paths outside vault untouched");
+  assert(vaultMarkdownPathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/image.png:1", vaultRoot) === null, "leaves non-Markdown files untouched");
 }
 
 {
