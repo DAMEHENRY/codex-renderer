@@ -285,6 +285,15 @@
   font-weight: 600;
 }
 
+/* ─── Math blocks (Obsidian MathJax) ────────────────────────────────────── */
+
+.codex-renderer-view .cx-message-content .math.math-block,
+.codex-renderer-view .cx-message-content mjx-container[display="true"] {
+  overflow-x: auto;
+  max-width: 100%;
+  padding: 2px 0;
+}
+
 /* ─── Wikilinks ────────────────────────────────────────────────────────── */
 
 .cx-wikilink {

@@ -5,8 +5,9 @@
  * deterministic and unit-testable from a CJS test bundle.
  */
 
-import { pathToFileURL } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 import { homedir } from "os";
+import { isAbsolute, relative, resolve, sep } from "path";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                         */
@@ -29,6 +30,11 @@ export const EXTENSION_RANK: Record<string, number> = {
   md: 0, pdf: 1, html: 2, htm: 3, txt: 4, json: 5,
   ts: 6, js: 7, py: 8, yaml: 9, yml: 10, toml: 11,
 };
+
+/** Chromium reports IME composition either directly or via the legacy keyCode 229. */
+export function isImeCompositionEvent(event: { isComposing?: boolean; keyCode?: number }): boolean {
+  return event.isComposing === true || event.keyCode === 229;
+}
 
 export const CODEX_CHILD_PATH_PREPEND = [
   "/Applications/ChatGPT.app/Contents/Resources",
@@ -188,6 +194,157 @@ export function buildCodexExecArgs(opts: {
   args.push("--", "-");
 
   return args;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Markdown math normalization                                      */
+/* ------------------------------------------------------------------ */
+
+export interface NormalizedMathMarkdown {
+  markdown: string;
+  mathSources: string[];
+}
+
+/**
+ * Convert common LaTeX delimiters into the dollar-delimited form that
+ * Obsidian's MarkdownRenderer understands. Code spans/fences and unmatched
+ * delimiters are preserved verbatim. Sources remain in rendered document
+ * order so the UI can associate MathJax nodes with their original LaTeX.
+ */
+export function normalizeMathForObsidian(markdown: string): NormalizedMathMarkdown {
+  const mathSources: string[] = [];
+  let output = "";
+  let index = 0;
+  let atLineStart = true;
+  let fence: { char: "`" | "~"; length: number } | null = null;
+
+  while (index < markdown.length) {
+    if (atLineStart) {
+      const lineEnd = markdown.indexOf("\n", index);
+      const contentEnd = lineEnd === -1 ? markdown.length : lineEnd;
+      const line = markdown.slice(index, contentEnd);
+      const fenceRun = line.match(/^[ \t]{0,3}(`{3,}|~{3,})/);
+
+      if (fence) {
+        output += markdown.slice(index, lineEnd === -1 ? markdown.length : lineEnd + 1);
+        const closingRun = line.match(/^[ \t]{0,3}(`+|~+)[ \t]*$/);
+        if (closingRun && closingRun[1][0] === fence.char && closingRun[1].length >= fence.length) {
+          fence = null;
+        }
+        if (lineEnd === -1) break;
+        index = lineEnd + 1;
+        atLineStart = true;
+        continue;
+      }
+
+      if (fenceRun) {
+        fence = {
+          char: fenceRun[1][0] as "`" | "~",
+          length: fenceRun[1].length,
+        };
+        output += markdown.slice(index, lineEnd === -1 ? markdown.length : lineEnd + 1);
+        if (lineEnd === -1) break;
+        index = lineEnd + 1;
+        atLineStart = true;
+        continue;
+      }
+    }
+
+    if (markdown[index] === "`") {
+      const runLength = countRun(markdown, index, "`");
+      const delimiter = "`".repeat(runLength);
+      const closingIndex = markdown.indexOf(delimiter, index + runLength);
+      if (closingIndex !== -1) {
+        const end = closingIndex + runLength;
+        const raw = markdown.slice(index, end);
+        output += raw;
+        index = end;
+        atLineStart = raw.endsWith("\n");
+        continue;
+      }
+    }
+
+    const delimiter = mathDelimiterAt(markdown, index);
+    if (delimiter) {
+      const closingIndex = findClosingMathDelimiter(
+        markdown,
+        index + delimiter.open.length,
+        delimiter.close,
+        delimiter.allowNewlines,
+      );
+
+      if (closingIndex !== -1) {
+        const body = markdown.slice(index + delimiter.open.length, closingIndex);
+        const inlineDollarIsValid = delimiter.open !== "$" || (
+          body.length > 0 && !/^\s/.test(body) && !/\s$/.test(body)
+        );
+
+        if (inlineDollarIsValid) {
+          const canonical = delimiter.block ? `$$${body}$$` : `$${body}$`;
+          output += canonical;
+          mathSources.push(canonical);
+          index = closingIndex + delimiter.close.length;
+          atLineStart = canonical.endsWith("\n");
+          continue;
+        }
+      }
+    }
+
+    const char = markdown[index];
+    output += char;
+    index += 1;
+    atLineStart = char === "\n";
+  }
+
+  return { markdown: output, mathSources };
+}
+
+function countRun(text: string, start: number, char: string): number {
+  let length = 0;
+  while (text[start + length] === char) length += 1;
+  return length;
+}
+
+function isEscaped(text: string, index: number): boolean {
+  let slashes = 0;
+  for (let cursor = index - 1; cursor >= 0 && text[cursor] === "\\"; cursor -= 1) {
+    slashes += 1;
+  }
+  return slashes % 2 === 1;
+}
+
+function mathDelimiterAt(
+  text: string,
+  index: number,
+): { open: string; close: string; block: boolean; allowNewlines: boolean } | null {
+  if (text.startsWith("\\[", index) && !isEscaped(text, index)) {
+    return { open: "\\[", close: "\\]", block: true, allowNewlines: true };
+  }
+  if (text.startsWith("\\(", index) && !isEscaped(text, index)) {
+    return { open: "\\(", close: "\\)", block: false, allowNewlines: false };
+  }
+  if (text.startsWith("$$", index) && !isEscaped(text, index)) {
+    return { open: "$$", close: "$$", block: true, allowNewlines: true };
+  }
+  if (text[index] === "$" && text[index + 1] !== "$" && !isEscaped(text, index)) {
+    return { open: "$", close: "$", block: false, allowNewlines: false };
+  }
+  return null;
+}
+
+function findClosingMathDelimiter(
+  text: string,
+  start: number,
+  delimiter: string,
+  allowNewlines: boolean,
+): number {
+  for (let index = start; index < text.length; index += 1) {
+    if (!allowNewlines && text[index] === "\n") return -1;
+    if (!text.startsWith(delimiter, index) || isEscaped(text, index)) continue;
+    if (delimiter === "$" && (text[index - 1] === "$" || text[index + 1] === "$")) continue;
+    return index;
+  }
+  return -1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -624,4 +781,42 @@ export function getImageOnlyPromptAndDisplay(hasImages: boolean, rawText: string
 
 export function imageSrcForPath(absPath: string): string {
   return pathToFileURL(absPath).href;
+}
+
+/**
+ * Recognize the narrow local-link shape emitted by Codex file citations.
+ *
+ * Only absolute Markdown paths inside the current vault are accepted. Web
+ * URLs, relative links, paths outside the vault, and non-Markdown files are
+ * intentionally left for Obsidian's normal renderer.
+ */
+export function vaultMarkdownPathFromHref(href: string, vaultRoot: string): string | null {
+  const raw = (href || "").trim();
+  if (!raw || !vaultRoot) return null;
+
+  let candidate: string;
+  try {
+    if (raw.startsWith("file://")) {
+      candidate = fileURLToPath(raw);
+    } else if (raw.startsWith("/")) {
+      candidate = raw;
+    } else {
+      return null;
+    }
+    candidate = decodeURIComponent(candidate);
+  } catch {
+    return null;
+  }
+
+  // Codex file citations may append a source line, e.g. "/note.md:9".
+  candidate = candidate.replace(/:(\d+)(?:-\d+)?$/, "");
+  if (!isAbsolute(candidate)) return null;
+
+  const root = resolve(vaultRoot);
+  const target = resolve(candidate);
+  const rel = relative(root, target);
+  if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
+  if (!rel.toLowerCase().endsWith(".md")) return null;
+
+  return rel.split(sep).join("/");
 }

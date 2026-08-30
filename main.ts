@@ -52,6 +52,9 @@ import {
   getEffortDisplayLabel,
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
+  normalizeMathForObsidian,
+  vaultMarkdownPathFromHref,
+  isImeCompositionEvent,
   type ContextChip,
 } from "./session-logic";
 
@@ -225,6 +228,7 @@ function enqueueRender(
   app: App,
   version: number,
 ): void {
+  const normalized = normalizeMathForObsidian(md);
   const token = ++renderTokenCounter;
   renderStateMap.set(el, { version, token });
   renderQueue.push(async () => {
@@ -232,10 +236,12 @@ function enqueueRender(
     if (!state || state.version !== version || state.token !== token) return;
     try {
       el.innerHTML = "";
-      await MarkdownRenderer.render(app, md, el, sourcePath, undefined as any);
+      await MarkdownRenderer.render(app, normalized.markdown, el, sourcePath, undefined as any);
       const latestState = renderStateMap.get(el);
       if (!latestState || latestState.version !== version || latestState.token !== token) return;
+      attachMathSources(el, normalized.mathSources);
       postProcessWikilinks(el, app);
+      postProcessVaultMarkdownLinks(el, app);
     } catch {
       const latestState = renderStateMap.get(el);
       if (latestState && latestState.version === version && latestState.token === token) {
@@ -244,6 +250,17 @@ function enqueueRender(
     }
   });
   drainRenderQueue();
+}
+
+function attachMathSources(el: HTMLElement, mathSources: string[]): void {
+  const mathNodes = Array.from(
+    el.querySelectorAll<HTMLElement>(".math.math-inline, .math.math-block"),
+  );
+  if (mathNodes.length !== mathSources.length) return;
+
+  mathNodes.forEach((node, index) => {
+    node.dataset.cxMathSource = mathSources[index];
+  });
 }
 
 async function drainRenderQueue(): Promise<void> {
@@ -316,6 +333,37 @@ function postProcessWikilinks(el: HTMLElement, app: App): void {
       tn.parentNode?.replaceChild(frag, tn);
     }
   }
+}
+
+/**
+ * Convert only existing vault Markdown file citations into Obsidian links.
+ * External URLs and all other Markdown links remain untouched.
+ */
+function postProcessVaultMarkdownLinks(el: HTMLElement, app: App): void {
+  const vaultRoot = (app.vault.adapter as any)?.basePath;
+  if (!vaultRoot) return;
+
+  const anchors = el.querySelectorAll<HTMLAnchorElement>("a[href]");
+  anchors.forEach((anchor) => {
+    if (anchor.classList.contains("internal-link")) return;
+
+    const vaultPath = vaultMarkdownPathFromHref(anchor.getAttribute("href") || "", vaultRoot);
+    if (!vaultPath) return;
+
+    const file = app.vault.getAbstractFileByPath(vaultPath);
+    if (!(file instanceof TFile)) return;
+
+    anchor.classList.remove("external-link");
+    anchor.classList.add("internal-link", "cx-wikilink");
+    anchor.removeAttribute("target");
+    anchor.removeAttribute("rel");
+    anchor.setAttribute("data-href", vaultPath);
+    anchor.addEventListener("click", (evt) => {
+      evt.preventDefault();
+      evt.stopPropagation();
+      app.workspace.openLinkText(vaultPath, "", "tab");
+    });
+  });
 }
 
 /* ================================================================== */
@@ -1111,6 +1159,7 @@ class CodexChatView extends ItemView {
   }
 
   private handleInputKeydown(evt: KeyboardEvent): void {
+    if (isImeCompositionEvent(evt)) return;
     if (this.mentionActive) {
       if (evt.key === "ArrowDown") {
         evt.preventDefault();
@@ -1221,12 +1270,6 @@ class CodexChatView extends ItemView {
       return;
     }
 
-    const selectedText = selection.toString().trim();
-    if (!selectedText) {
-      this.hideQuotePopover();
-      return;
-    }
-
     const range = selection.getRangeAt(0);
 
     if (!isSelectionInsideContainer(this.chatEl, range.startContainer, range.endContainer)) {
@@ -1240,13 +1283,20 @@ class CodexChatView extends ItemView {
       return;
     }
 
+    const mathElements = this.intersectedMathElements(range, content);
+    const selectedText = this.selectedQuoteText(selection, range, mathElements);
+    if (!selectedText) {
+      this.hideQuotePopover();
+      return;
+    }
+
     const messageWrapper = content.closest(".cx-message-user, .cx-message-assistant") as HTMLElement | null;
     if (!messageWrapper) {
       this.hideQuotePopover();
       return;
     }
 
-    const rect = this.selectionViewportRect(range);
+    const rect = this.selectionViewportRect(range, mathElements);
     if (!rect) {
       this.hideQuotePopover();
       return;
@@ -1265,6 +1315,45 @@ class CodexChatView extends ItemView {
     };
 
     this.showQuotePopover(rect);
+  }
+
+  private intersectedMathElements(range: Range, content: HTMLElement): HTMLElement[] {
+    return Array.from(
+      content.querySelectorAll<HTMLElement>(".math[data-cx-math-source]"),
+    ).filter((math) => {
+      try {
+        return range.intersectsNode(math);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private selectedQuoteText(
+    selection: Selection,
+    range: Range,
+    mathElements: HTMLElement[],
+  ): string {
+    const nativeText = selection.toString().trim();
+    if (mathElements.length === 0) return nativeText;
+
+    const fragment = range.cloneContents();
+    const clonedMath = Array.from(
+      fragment.querySelectorAll<HTMLElement>(".math[data-cx-math-source]"),
+    );
+    for (const math of clonedMath) {
+      math.replaceWith(document.createTextNode(math.dataset.cxMathSource || ""));
+    }
+
+    const reconstructed = (fragment.textContent || "").trim();
+    if (clonedMath.length > 0 && reconstructed) return reconstructed;
+
+    const mathSources = mathElements
+      .map((math) => math.dataset.cxMathSource || "")
+      .filter(Boolean);
+    if (mathSources.length === 0) return nativeText;
+    if (!nativeText) return mathSources.join("\n");
+    return `${nativeText}\n${mathSources.join("\n")}`;
   }
 
   private selectedMessageContent(range: Range): HTMLElement | null {
@@ -1300,12 +1389,17 @@ class CodexChatView extends ItemView {
     return content;
   }
 
-  private selectionViewportRect(range: Range): DOMRect | null {
+  private selectionViewportRect(range: Range, mathElements: HTMLElement[] = []): DOMRect | null {
     const rect = range.getBoundingClientRect();
     if (rect.width > 0 || rect.height > 0) return rect;
 
     const firstRect = Array.from(range.getClientRects()).find((r) => r.width > 0 || r.height > 0);
-    return firstRect || null;
+    if (firstRect) return firstRect;
+
+    const mathRect = mathElements
+      .map((math) => math.getBoundingClientRect())
+      .find((candidate) => candidate.width > 0 || candidate.height > 0);
+    return mathRect || null;
   }
 
   private showQuotePopover(selectionRect: DOMRect): void {

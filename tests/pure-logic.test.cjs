@@ -33,6 +33,9 @@ const {
   CODEX_APP_ENABLED_REASONING_EFFORTS,
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
+  normalizeMathForObsidian,
+  vaultMarkdownPathFromHref,
+  isImeCompositionEvent,
 } = require("./session-logic-bundle.cjs");
 
 let passed = 0;
@@ -57,6 +60,11 @@ function assertDeepEqual(a, b, label) {
     console.error(`FAIL: ${label}\n  Expected: ${strB}\n  Got:      ${strA}`);
   }
 }
+
+// ─── Composer IME handling ───────────────────────────────────────────────
+assert(isImeCompositionEvent({ isComposing: true, keyCode: 13 }), "IME composition blocks Enter");
+assert(isImeCompositionEvent({ isComposing: false, keyCode: 229 }), "legacy IME keyCode blocks Enter");
+assert(!isImeCompositionEvent({ isComposing: false, keyCode: 13 }), "normal Enter is not composition");
 
 // ─── buildReasoningEffortArg ─────────────────────────────────────────────
 assertDeepEqual(buildReasoningEffortArg("default"), [], "reasoning effort default");
@@ -419,6 +427,70 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
   const urlStr = imageSrcForPath("/abs/path/img.png");
   assert(urlStr.startsWith("file://"), "converts path to file:// URL");
   assert(urlStr.includes("img.png"), "url includes filename");
+}
+
+// ─── normalizeMathForObsidian ─────────────────────────────────────────────
+{
+  const source = "Before\n\\[\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n\\]\nAfter";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown.includes("$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"), "normalizes bracketed block math");
+  assertDeepEqual(result.mathSources, ["$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"], "captures normalized block source");
+}
+
+// ─── vaultMarkdownPathFromHref ────────────────────────────────────────────
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  const href = "/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
+  assert(
+    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    "converts absolute vault Markdown citation with line number",
+  );
+}
+
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  const href = "file:///Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
+  assert(
+    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    "converts file URL vault Markdown citation",
+  );
+}
+
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  assert(vaultMarkdownPathFromHref("https://example.com/note.md", vaultRoot) === null, "leaves web URLs untouched");
+  assert(vaultMarkdownPathFromHref("quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md", vaultRoot) === null, "leaves relative links untouched");
+  assert(vaultMarkdownPathFromHref("/Users/henry/outside/note.md:1", vaultRoot) === null, "leaves paths outside vault untouched");
+  assert(vaultMarkdownPathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/image.png:1", vaultRoot) === null, "leaves non-Markdown files untouched");
+}
+
+{
+  const source = "Use \\(K=5\\), keep $x_t$, and show $$y_t=2$$.";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === "Use $K=5$, keep $x_t$, and show $$y_t=2$$.", "normalizes inline math and preserves dollar math");
+  assertDeepEqual(result.mathSources, ["$K=5$", "$x_t$", "$$y_t=2$$"], "captures math sources in document order");
+}
+
+{
+  const source = [
+    "```md",
+    "\\[not math\\] and $also_not_math$",
+    "```",
+    "Inline `\\(not math\\)` stays code.",
+    "~~~",
+    "$$not math$$",
+    "~~~",
+  ].join("\n");
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === source, "leaves fenced and inline code unchanged");
+  assertDeepEqual(result.mathSources, [], "does not capture math inside code");
+}
+
+{
+  const source = "Unmatched \\(K and \\[x stay unchanged; escaped \\$5 is money.";
+  const result = normalizeMathForObsidian(source);
+  assert(result.markdown === source, "leaves unmatched and escaped delimiters unchanged");
+  assertDeepEqual(result.mathSources, [], "does not capture unmatched delimiters");
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
