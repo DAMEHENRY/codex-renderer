@@ -31,6 +31,11 @@ export const EXTENSION_RANK: Record<string, number> = {
   ts: 6, js: 7, py: 8, yaml: 9, yml: 10, toml: 11,
 };
 
+/** Chromium reports IME composition either directly or via the legacy keyCode 229. */
+export function isImeCompositionEvent(event: { isComposing?: boolean; keyCode?: number }): boolean {
+  return event.isComposing === true || event.keyCode === 229;
+}
+
 export const CODEX_CHILD_PATH_PREPEND = [
   "/Applications/ChatGPT.app/Contents/Resources",
   "/Applications/Codex.app/Contents/Resources",

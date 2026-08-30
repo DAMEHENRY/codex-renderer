@@ -54,6 +54,7 @@ import {
   imageSrcForPath,
   normalizeMathForObsidian,
   vaultMarkdownPathFromHref,
+  isImeCompositionEvent,
   type ContextChip,
 } from "./session-logic";
 
@@ -1158,6 +1159,7 @@ class CodexChatView extends ItemView {
   }
 
   private handleInputKeydown(evt: KeyboardEvent): void {
+    if (isImeCompositionEvent(evt)) return;
     if (this.mentionActive) {
       if (evt.key === "ArrowDown") {
         evt.preventDefault();

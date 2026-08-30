@@ -35,6 +35,7 @@ const {
   imageSrcForPath,
   normalizeMathForObsidian,
   vaultMarkdownPathFromHref,
+  isImeCompositionEvent,
 } = require("./session-logic-bundle.cjs");
 
 let passed = 0;
@@ -59,6 +60,11 @@ function assertDeepEqual(a, b, label) {
     console.error(`FAIL: ${label}\n  Expected: ${strB}\n  Got:      ${strA}`);
   }
 }
+
+// ─── Composer IME handling ───────────────────────────────────────────────
+assert(isImeCompositionEvent({ isComposing: true, keyCode: 13 }), "IME composition blocks Enter");
+assert(isImeCompositionEvent({ isComposing: false, keyCode: 229 }), "legacy IME keyCode blocks Enter");
+assert(!isImeCompositionEvent({ isComposing: false, keyCode: 13 }), "normal Enter is not composition");
 
 // ─── buildReasoningEffortArg ─────────────────────────────────────────────
 assertDeepEqual(buildReasoningEffortArg("default"), [], "reasoning effort default");
