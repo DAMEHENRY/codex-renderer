@@ -11,6 +11,7 @@
  */
 
 import {
+  addIcon,
   App,
   ItemView,
   MarkdownRenderer,
@@ -63,10 +64,22 @@ import {
 /* ================================================================== */
 
 const VIEW_TYPE = "codex-renderer-view";
-const VIEW_ICON = "terminal";
+const VIEW_ICON = "codex-logo";
+
+/**
+ * Codex's official icon, drawn on a 20x20 grid and scaled into the 100x100 box
+ * Obsidian's icon registry expects. The artwork already uses currentColor, so it
+ * inherits ribbon and tab-header states like every other Obsidian icon.
+ */
+const CODEX_LOGO_SVG = '<g transform="scale(5)"><path d="M13.333 11.418C13.7002 11.418 13.9978 11.7159 13.998 12.083C13.998 12.4503 13.7003 12.748 13.333 12.748H10.833C10.4657 12.748 10.168 12.4503 10.168 12.083C10.1682 11.7159 10.4659 11.418 10.833 11.418H13.333Z" fill="currentColor" /><path d="M6.74121 7.34668C7.0561 7.15796 7.46442 7.26036 7.65332 7.5752L8.90332 9.6582C9.02949 9.86874 9.02961 10.1323 8.90332 10.3428L7.65332 12.4258C7.46441 12.7403 7.05597 12.8427 6.74121 12.6543C6.42637 12.4654 6.32396 12.0561 6.5127 11.7412L7.55664 10L6.5127 8.25879C6.324 7.94395 6.4265 7.53562 6.74121 7.34668Z" fill="currentColor" /><path fill-rule="evenodd" clip-rule="evenodd" d="M9.00195 1.75C10.1157 1.75021 11.1362 2.15467 11.9238 2.82227C12.1849 2.77516 12.455 2.74903 12.7295 2.74902C15.2262 2.74978 17.2507 4.77449 17.251 7.27148C17.2509 7.54581 17.2238 7.81473 17.1768 8.0752C17.8448 8.86317 18.2499 9.88479 18.25 10.999C18.2496 12.9609 16.9996 14.6284 15.2549 15.2549C14.6285 16.9998 12.9608 18.2497 10.999 18.25C9.88486 18.25 8.86411 17.8448 8.07617 17.1768C7.8155 17.2239 7.54592 17.2509 7.27148 17.251C4.77445 17.2507 2.7504 15.2257 2.75 12.7285C2.75003 12.4539 2.77608 12.1848 2.82324 11.9238C2.20237 11.1913 1.80895 10.2574 1.75684 9.23438L1.75 9.00098C1.75022 7.03932 2.99952 5.36992 4.74414 4.74316C5.37104 2.99851 7.04034 1.75002 9.00195 1.75ZM9.00195 3.07812C7.52474 3.07814 6.27967 4.08156 5.91504 5.44531C5.85362 5.67419 5.67418 5.85363 5.44531 5.91504C4.08208 6.27984 3.07836 7.52408 3.07812 9.00098C3.07826 9.88321 3.43594 10.682 4.01465 11.2607C4.1816 11.4283 4.24663 11.6728 4.18555 11.9014C4.11505 12.1653 4.07719 12.4429 4.07715 12.7285C4.07755 14.4925 5.50753 15.9225 7.27148 15.9229C7.55712 15.9228 7.83548 15.886 8.09961 15.8154L8.18652 15.7979C8.38833 15.7722 8.59297 15.8403 8.73926 15.9863C9.31801 16.5649 10.1168 16.9218 10.999 16.9219C12.4759 16.9216 13.7203 15.9183 14.085 14.5547L14.1133 14.4707C14.1918 14.2821 14.3542 14.1386 14.5547 14.085C15.9181 13.7203 16.9225 12.4758 16.9229 10.999C16.9228 10.1168 16.5648 9.31802 15.9863 8.73926C15.819 8.57175 15.7544 8.3274 15.8154 8.09863C15.886 7.83454 15.9238 7.5568 15.9238 7.27148C15.9235 5.50751 14.4924 4.07762 12.7285 4.07715C12.4424 4.0772 12.164 4.11412 11.9004 4.18457C11.672 4.24541 11.4282 4.18048 11.2607 4.01367C10.7183 3.47141 9.98306 3.12271 9.16699 3.08105L9.00195 3.07812Z" fill="currentColor" /></g>';
 const MAX_CONVERSATIONS = 20;
 const WRITE_DEBOUNCE_MS = 500;
 const SELECTION_POLL_MS = 250;
+
+/** Popout window geometry: a chat column, cascaded so windows never stack exactly. */
+const POPOUT_WIDTH = 520;
+const POPOUT_HEIGHT = 820;
+const POPOUT_CASCADE_PX = 36;
 
 /* ================================================================== */
 /*  Settings                                                          */
@@ -405,12 +418,13 @@ export default class CodexRendererPlugin extends Plugin {
     this.historyStore = new HistoryStore(this.app);
     this.historyStore.load();
 
+    addIcon(VIEW_ICON, CODEX_LOGO_SVG);
     this.registerView(VIEW_TYPE, (leaf) => new CodexChatView(leaf, this));
 
-    const ribbonEl = this.addRibbonIcon(VIEW_ICON, "Open New Codex Chat Window", () => {
+    const ribbonEl = this.addRibbonIcon(VIEW_ICON, "Open New Codex Chat", () => {
       this.activateNewView();
     });
-    ribbonEl.setAttribute("aria-label", "Open New Codex Chat Window");
+    ribbonEl.setAttribute("aria-label", "Open New Codex Chat");
 
     this.addCommand({
       id: "open-codex-chat",
@@ -421,7 +435,7 @@ export default class CodexRendererPlugin extends Plugin {
     this.addCommand({
       id: "open-new-codex-chat-window",
       name: "Open New Codex Chat Window",
-      callback: () => this.activateNewView(),
+      callback: () => this.activatePopoutView(),
     });
 
     this.addSettingTab(new CodexRendererSettingTab(this.app, this));
@@ -487,9 +501,33 @@ export default class CodexRendererPlugin extends Plugin {
   async activateNewView(): Promise<void> {
     const { workspace } = this.app;
     let leaf: WorkspaceLeaf | null = null;
-    try {
-      leaf = workspace.getRightLeaf(true);
-    } catch {}
+
+    // A second chat belongs in its own full-height sidebar tab. getRightLeaf(true)
+    // splits the sidebar instead, stacking the two chats as half-height panes, so
+    // create the leaf as a sibling inside the existing chat's tab group.
+    const existing = workspace.getLeavesOfType(VIEW_TYPE);
+    const host = existing.length > 0 ? existing[existing.length - 1].parent : null;
+    if (host) {
+      try {
+        const siblings = (host as unknown as { children?: unknown[] }).children;
+        leaf = workspace.createLeafInParent(host as any, siblings ? siblings.length : 0);
+      } catch {
+        leaf = null;
+      }
+    }
+
+    // No chat open yet (or the tab group is gone) — fall back to the configured
+    // placement, still without splitting.
+    if (!leaf) {
+      const placement = this.settings.viewPlacement;
+      if (placement === "left") {
+        leaf = workspace.getLeftLeaf(false);
+      } else if (placement === "tab") {
+        leaf = workspace.getLeaf("tab");
+      } else {
+        leaf = workspace.getRightLeaf(false);
+      }
+    }
     if (!leaf) leaf = workspace.getLeaf("tab");
     if (!leaf) return;
 
@@ -500,6 +538,80 @@ export default class CodexRendererPlugin extends Plugin {
       state: { freshChat: true },
     });
     workspace.revealLeaf(leaf);
+  }
+
+  /**
+   * Open a chat in its own popout window.
+   *
+   * A sidebar shows one tab at a time, so a second chat there hides the first —
+   * "New Window" should give a window you can put beside the main one instead.
+   * openPopoutLeaf() is desktop-only and throws on mobile, so fall back to the
+   * sidebar tab there.
+   */
+  async activatePopoutView(): Promise<void> {
+    const { workspace } = this.app;
+    const init: { x?: number; y?: number; size: { width: number; height: number } } = {
+      size: { width: POPOUT_WIDTH, height: POPOUT_HEIGHT },
+    };
+    const origin = this.nextPopoutOrigin();
+    if (origin) {
+      init.x = origin.x;
+      init.y = origin.y;
+    }
+
+    let leaf: WorkspaceLeaf | null = null;
+    try {
+      leaf = workspace.openPopoutLeaf(init);
+    } catch {
+      leaf = null;
+    }
+    if (!leaf) {
+      await this.activateNewView();
+      return;
+    }
+
+    this.freshChatLeaves.add(leaf);
+    await leaf.setViewState({
+      type: VIEW_TYPE,
+      active: true,
+      state: { freshChat: true },
+    });
+    workspace.revealLeaf(leaf);
+  }
+
+  /**
+   * Where to place the next popout.
+   *
+   * Obsidian puts every popout at the same default spot, so a second window
+   * lands exactly on top of the first and reads as "the window was replaced".
+   * Cascade off the most recent chat popout instead; returns null when there is
+   * none, letting Obsidian pick the default position.
+   */
+  private nextPopoutOrigin(): { x: number; y: number } | null {
+    // Walk every leaf, not just this plugin's: the newest popout comes last in
+    // layout order, and cascading off any popout keeps a new chat window from
+    // landing exactly on another plugin's.
+    let last: Window | null = null;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      try {
+        const win = leaf.getContainer().win;
+        if (win && win !== window) last = win;
+      } catch {
+        // Leaf detached mid-iteration — skip it.
+      }
+    });
+    if (!last) return null;
+
+    const x = (last as Window).screenX + POPOUT_CASCADE_PX;
+    const y = (last as Window).screenY + POPOUT_CASCADE_PX;
+
+    // Once the cascade would run off screen, start over from Obsidian's default.
+    const availWidth = window.screen ? window.screen.availWidth : 0;
+    const availHeight = window.screen ? window.screen.availHeight : 0;
+    if (availWidth && x + POPOUT_WIDTH > availWidth) return null;
+    if (availHeight && y + POPOUT_HEIGHT > availHeight) return null;
+
+    return { x, y };
   }
 
   consumeFreshChatLeaf(leaf: WorkspaceLeaf): boolean {
