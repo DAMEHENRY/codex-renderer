@@ -15,8 +15,10 @@ import {
   App,
   ItemView,
   MarkdownRenderer,
+  Menu,
   Modal,
   Notice,
+  Platform,
   Plugin,
   PluginSettingTab,
   Setting,
@@ -990,6 +992,10 @@ class CodexChatView extends ItemView {
   private selectionInterval: ReturnType<typeof setInterval> | null = null;
   private pendingQuote: ContextChip | null = null;
   private quoteSelectionTimer: number | null = null;
+  private continuityCaptureProcess: any = null;
+  private continuityCaptureOpen = false;
+  private continuityCaptureCancelled = false;
+  private continuityCaptureCancelPath: string | null = null;
   private skipInitialRestore: boolean;
 
   constructor(leaf: WorkspaceLeaf, plugin: CodexRendererPlugin) {
@@ -1151,6 +1157,11 @@ class CodexChatView extends ItemView {
 
     // Auto-resize
     this.inputEl.addEventListener("input", () => this.autoResizeInput());
+    this.registerDomEvent(this.inputEl, "contextmenu", (evt) => {
+      if (!Platform.isMacOS) return;
+      evt.preventDefault();
+      this.showInputContextMenu(evt);
+    });
 
     // Selection polling
     this.selectionInterval = setInterval(() => this.pollEditorSelection(), SELECTION_POLL_MS);
@@ -1166,9 +1177,280 @@ class CodexChatView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.selectionInterval) clearInterval(this.selectionInterval);
+    if (this.continuityCaptureOpen && this.continuityCaptureCancelPath) {
+      this.continuityCaptureCancelled = true;
+      try {
+        require("fs").writeFileSync(this.continuityCaptureCancelPath, "cancel");
+      } catch {}
+    }
     this.hideQuotePopover();
     this.quotePopoverEl?.remove();
     this.plugin.historyStore.flushNow();
+  }
+
+  private showInputContextMenu(evt: MouseEvent): void {
+    const input = this.inputEl;
+    const hasSelection = input.selectionStart !== input.selectionEnd;
+    const menu = new Menu().setUseNativeMenu(true);
+
+    menu.addItem((item) => {
+      item
+        .setTitle("Import from iPhone…")
+        .setIcon("smartphone")
+        .onClick(() => this.startContinuityCapture());
+    });
+    menu.addSeparator();
+    menu.addItem((item) => {
+      item
+        .setTitle("Cut")
+        .setDisabled(!hasSelection)
+        .onClick(() => {
+          input.focus();
+          document.execCommand("cut");
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Copy")
+        .setDisabled(!hasSelection)
+        .onClick(() => {
+          input.focus();
+          document.execCommand("copy");
+        });
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Paste")
+        .onClick(() => void this.pasteFromSystemClipboard(false));
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Paste as Text")
+        .onClick(() => void this.pasteFromSystemClipboard(true));
+    });
+    menu.addItem((item) => {
+      item
+        .setTitle("Select All")
+        .onClick(() => {
+          input.focus();
+          input.select();
+        });
+    });
+    menu.showAtMouseEvent(evt);
+  }
+
+  private async pasteFromSystemClipboard(plainTextOnly: boolean): Promise<void> {
+    try {
+      const clipboard = navigator.clipboard as any;
+      if (!plainTextOnly && typeof clipboard.read === "function") {
+        const items: any[] = await clipboard.read();
+        for (const item of items) {
+          const imageType = (item.types as string[]).find((type) => type.startsWith("image/"));
+          if (!imageType) continue;
+          const blob: Blob = await item.getType(imageType);
+          const extension = imageType === "image/jpeg" ? ".jpg" : `.${imageType.split("/")[1] || "png"}`;
+          const image = new File([blob], `clipboard${extension}`, { type: imageType });
+          await this.saveImageBlobAsAttachment(image);
+          this.inputEl.focus();
+          return;
+        }
+      }
+
+      const text = await clipboard.readText();
+      const input = this.inputEl;
+      const start = input.selectionStart;
+      const end = input.selectionEnd;
+      input.setRangeText(text, start, end, "end");
+      input.dispatchEvent(new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertFromPaste",
+        data: text,
+      }));
+      this.inputEl.focus();
+    } catch (error) {
+      new Notice(`Couldn't read the clipboard: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  private startContinuityCapture(): void {
+    if (!Platform.isMacOS) {
+      new Notice("Import from iPhone is available on macOS.");
+      return;
+    }
+    if (this.continuityCaptureOpen) return;
+
+    const fs = require("fs");
+    const path = require("path");
+    const { spawn } = require("child_process");
+    const vaultBase = (this.app.vault.adapter as any).basePath;
+    if (!vaultBase) {
+      new Notice("Could not locate the vault folder for iPhone import.");
+      return;
+    }
+
+    const pluginDir = path.join(
+      vaultBase,
+      this.plugin.manifest.dir || `.obsidian/plugins/${this.plugin.manifest.id}`,
+    );
+    const helperBundlePath = path.join(
+      pluginDir,
+      "native",
+      "build",
+      "CodexRendererContinuity.app",
+    );
+    const helperExecutablePath = path.join(
+      helperBundlePath,
+      "Contents",
+      "MacOS",
+      "CodexRendererContinuity",
+    );
+    if (!fs.existsSync(helperExecutablePath)) {
+      new Notice("The iPhone import helper isn't built yet. Run `npm run build` in the Codex Renderer plugin folder, then reload Obsidian.");
+      return;
+    }
+
+    const attachmentsDir = this.getAttachmentsDir();
+    try {
+      fs.mkdirSync(attachmentsDir, { recursive: true });
+    } catch (error) {
+      new Notice(`Couldn't prepare the attachment folder: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+
+    const { randomUUID } = require("crypto");
+    const operationID = randomUUID();
+    const resultPath = path.join(attachmentsDir, `.iphone-import-${operationID}.json`);
+    const cancelPath = path.join(attachmentsDir, `.iphone-import-${operationID}.cancel`);
+    let stderr = "";
+    this.continuityCaptureOpen = true;
+    this.continuityCaptureCancelled = false;
+    this.continuityCaptureCancelPath = cancelPath;
+    const cleanupResultFiles = () => {
+      try { fs.rmSync(resultPath, { force: true }); } catch {}
+      try { fs.rmSync(cancelPath, { force: true }); } catch {}
+    };
+    const child = spawn("/usr/bin/open", [
+      "-nW",
+      "-a",
+      helperBundlePath,
+      "--args",
+      "--output-dir",
+      attachmentsDir,
+      "--result-file",
+      resultPath,
+      "--cancel-file",
+      cancelPath,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    this.continuityCaptureProcess = child;
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => { stderr += chunk; });
+    child.on("error", (error: Error) => {
+      this.continuityCaptureOpen = false;
+      this.continuityCaptureProcess = null;
+      this.continuityCaptureCancelPath = null;
+      cleanupResultFiles();
+      if (!this.continuityCaptureCancelled) {
+        new Notice(`Couldn't open the iPhone import window: ${error.message}`);
+      }
+    });
+    child.on("close", (code: number | null) => {
+      if (this.continuityCaptureProcess !== child) return;
+      this.continuityCaptureOpen = false;
+      this.continuityCaptureProcess = null;
+      this.continuityCaptureCancelPath = null;
+      try {
+        if (code !== 0) {
+          if (!this.continuityCaptureCancelled) {
+            new Notice(`The iPhone import window couldn't be opened${stderr.trim() ? `: ${stderr.trim()}` : "."}`);
+          }
+          return;
+        }
+
+        if (!fs.existsSync(resultPath)) {
+          if (!this.continuityCaptureCancelled) {
+            new Notice("The iPhone import window closed without returning an image.");
+          }
+          return;
+        }
+        const result = JSON.parse(fs.readFileSync(resultPath, "utf8")) as {
+          status?: string;
+          message?: string;
+          path?: string;
+          paths?: string[];
+        };
+        if (result.status === "cancelled" || this.continuityCaptureCancelled) return;
+        if (result.status === "error") {
+          new Notice(`Couldn't import from iPhone: ${result.message || "Unknown error."}`);
+          return;
+        }
+        const importedPaths = result.paths || (result.path ? [result.path] : []);
+        if (result.status !== "success" || importedPaths.length === 0) {
+          new Notice("The iPhone import finished without an image.");
+          return;
+        }
+        void this.addContinuityImages(importedPaths);
+      } catch (error) {
+        new Notice(`Couldn't read the iPhone import result: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        cleanupResultFiles();
+      }
+    });
+  }
+
+  private async addContinuityImages(importedPaths: string[]): Promise<void> {
+    const fs = require("fs");
+    const path = require("path");
+    const attachmentsDir = path.resolve(this.getAttachmentsDir());
+    let added = 0;
+
+    for (const importedPath of importedPaths) {
+      const absolutePath = path.resolve(importedPath);
+      const relativePath = path.relative(attachmentsDir, absolutePath);
+      if (
+        !relativePath ||
+        relativePath === ".." ||
+        relativePath.startsWith(`..${path.sep}`) ||
+        path.isAbsolute(relativePath)
+      ) {
+        new Notice("The iPhone import helper returned a file outside the attachment folder.");
+        continue;
+      }
+      if (!fs.existsSync(absolutePath) || !fs.statSync(absolutePath).isFile()) continue;
+      if (!isImageFilePath(absolutePath)) {
+        new Notice(`This iPhone import isn't an image that Codex can attach: ${path.basename(absolutePath)}`);
+        continue;
+      }
+      if (this.chips.some((chip) => chip.type === "image" && chip.sourcePath === absolutePath)) continue;
+
+      const extension = path.extname(absolutePath).toLowerCase();
+      const mime = extension === ".jpg" || extension === ".jpeg"
+        ? "image/jpeg"
+        : extension === ".png"
+          ? "image/png"
+          : `image/${extension.slice(1)}`;
+      const thumbnail = await this.generateThumbnail(absolutePath, mime);
+      let sizeBytes = 0;
+      try {
+        sizeBytes = fs.statSync(absolutePath).size;
+      } catch {}
+      this.addChip({
+        type: "image",
+        label: path.basename(absolutePath),
+        data: "",
+        sourcePath: absolutePath,
+        mime,
+        sizeBytes,
+        thumbnail,
+      });
+      added++;
+    }
+
+    if (added > 0) {
+      this.inputEl.focus();
+      new Notice(added === 1 ? "iPhone image added to the message." : `${added} iPhone images added to the message.`);
+    }
   }
 
   /* ------------------------------------------------------------------ */

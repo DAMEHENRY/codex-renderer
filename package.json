@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production",
+    "build": "npm run build:native && node esbuild.config.mjs production",
+    "build:native": "node native/build.mjs",
     "build:test": "node esbuild.config.mjs test",
     "test": "npm run build:test && node tests/pure-logic.test.cjs",
     "smoke": "npm run build && node tests/main-load-smoke.cjs"
