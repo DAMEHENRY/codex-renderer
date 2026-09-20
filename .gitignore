@@ -5,3 +5,4 @@ tests/session-logic-bundle.cjs
 data.json
 history.json
 attachments/
+native/build/

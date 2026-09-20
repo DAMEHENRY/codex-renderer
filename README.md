@@ -28,6 +28,8 @@ npm run build
 npm test
 ```
 
+On macOS, `npm run build` also builds the AppKit Continuity Camera helper used by the composer’s **Import from iPhone…** context-menu action. The helper opens a small native window; right-click its text area and choose **Import from iPhone** to take a photo, scan a document, or add a sketch. Captured pages are added to the current message as image attachments. Other platforms build the renderer without the macOS helper.
+
 The repository intentionally excludes local runtime state:
 
 - `history.json` — local UI cache of conversations
@@ -50,3 +52,4 @@ Use the following steps to verify that the plugin works inside Obsidian:
    python3 scripts/copilot.py writeback-ai-day --date YYYY-MM-DD
    ```
    Confirm that the script correctly processes the conversation from official Codex session files under `~/.codex/` and links it in your daily journal under `## 💬 From Kai` using wikilinks.
+7. **iPhone image import (macOS)**: Right-click the chat input and choose **Import from iPhone…**. In the native helper window, right-click the text area and choose **Import from iPhone** -> **Take Photo**, **Scan Documents**, or **Add Sketch**. Confirm the captured image pages appear as attachment chips and are sent with the next message.
