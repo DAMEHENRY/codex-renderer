@@ -34,7 +34,8 @@ const {
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
   normalizeMathForObsidian,
-  vaultMarkdownPathFromHref,
+  vaultFilePathFromHref,
+  isAbsoluteFileHref,
   isImeCompositionEvent,
 } = require("./session-logic-bundle.cjs");
 
@@ -437,12 +438,12 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
   assertDeepEqual(result.mathSources, ["$$\nP_t=\\frac{1}{K}\\sum_{j=0}^{K-1} C_{t-j}\n$$"], "captures normalized block source");
 }
 
-// ─── vaultMarkdownPathFromHref ────────────────────────────────────────────
+// ─── vaultFilePathFromHref ───────────────────────────────────────────────
 {
   const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
   const href = "/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
   assert(
-    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    vaultFilePathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
     "converts absolute vault Markdown citation with line number",
   );
 }
@@ -451,18 +452,70 @@ assert(appendPartialWarning("Hello").includes("incomplete"), "appends warning co
   const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
   const href = "file:///Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md:1";
   assert(
-    vaultMarkdownPathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
+    vaultFilePathFromHref(href, vaultRoot) === "quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md",
     "converts file URL vault Markdown citation",
   );
 }
 
 {
   const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
-  assert(vaultMarkdownPathFromHref("https://example.com/note.md", vaultRoot) === null, "leaves web URLs untouched");
-  assert(vaultMarkdownPathFromHref("quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md", vaultRoot) === null, "leaves relative links untouched");
-  assert(vaultMarkdownPathFromHref("/Users/henry/outside/note.md:1", vaultRoot) === null, "leaves paths outside vault untouched");
-  assert(vaultMarkdownPathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/image.png:1", vaultRoot) === null, "leaves non-Markdown files untouched");
+  assert(vaultFilePathFromHref("https://example.com/note.md", vaultRoot) === null, "leaves web URLs untouched");
+  assert(vaultFilePathFromHref("quant/arsenal/xp-81-stochastic-calculus-stabilization-guide.md", vaultRoot) === null, "leaves relative links untouched");
+  assert(vaultFilePathFromHref("/Users/henry/outside/note.md:1", vaultRoot) === null, "leaves paths outside vault untouched");
+  assert(vaultFilePathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/scripts/copilot.py:12", vaultRoot) === null, "leaves files Obsidian cannot open untouched");
+  assert(vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life-other/note.md", vaultRoot) === null, "leaves sibling folders with the vault name as prefix untouched");
+  assert(vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/../Other/note.md", vaultRoot) === null, "leaves paths that escape the vault untouched");
+  assert(vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life", vaultRoot) === null, "leaves the vault root itself untouched");
+  assert(vaultFilePathFromHref("obsidian://open?vault=Life&file=resources%2Fnote", vaultRoot) === null, "leaves obsidian URIs untouched");
+  assert(vaultFilePathFromHref("mailto:henry@example.com", vaultRoot) === null, "leaves mailto links untouched");
+  assert(vaultFilePathFromHref("", vaultRoot) === null, "ignores empty hrefs");
+  assert(vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/note.md", "") === null, "needs a vault root");
 }
+
+// Obsidian decodes the target of a colon-free link into data-href, so the
+// angle-bracket form Codex emits for paths with spaces arrives already decoded.
+{
+  const vaultRoot = "/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life";
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/resources/courses/uibe/2026-fall/time-series-analysis/class-notes.md", vaultRoot)
+      === "resources/courses/uibe/2026-fall/time-series-analysis/class-notes.md",
+    "converts a decoded absolute path with spaces",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/journal/ai-conversations/2026/09/2026-09-20-codex-trace.md:3256", vaultRoot)
+      === "journal/ai-conversations/2026/09/2026-09-20-codex-trace.md",
+    "strips a line suffix from a decoded path with spaces",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/journal/2026/09/2026-09-23.md", vaultRoot)
+      === "journal/2026/09/2026-09-23.md",
+    "converts a %20 path without a line suffix",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/resources/courses/uibe/2026-fall/causal-inference/因果推断方法 2.因果关系.pdf", vaultRoot)
+      === "resources/courses/uibe/2026-fall/causal-inference/因果推断方法 2.因果关系.pdf",
+    "converts a lecture PDF with a CJK name",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/resources/courses/uibe/2026-fall/causal-inference/%E5%9B%A0%E6%9E%9C.pdf:3", vaultRoot)
+      === "resources/courses/uibe/2026-fall/causal-inference/因果.pdf",
+    "decodes a percent-encoded CJK PDF path with a line suffix",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile%20Documents/iCloud~md~obsidian/Documents/Life/image.png:1", vaultRoot) === "image.png",
+    "converts images Obsidian can open",
+  );
+  assert(
+    vaultFilePathFromHref("/Users/henry/Library/Mobile Documents/iCloud~md~obsidian/Documents/Life/notes/100% done.md", vaultRoot) === "notes/100% done.md",
+    "keeps a literal percent sign in an already-decoded path",
+  );
+}
+
+// ─── isAbsoluteFileHref ──────────────────────────────────────────────────
+assert(isAbsoluteFileHref("/Users/henry/note.md"), "absolute path is a file href");
+assert(isAbsoluteFileHref("file:///Users/henry/note.md"), "file URL is a file href");
+assert(!isAbsoluteFileHref("resources/note"), "relative link is not a file href");
+assert(!isAbsoluteFileHref("https://example.com"), "web URL is not a file href");
 
 {
   const source = "Use \\(K=5\\), keep $x_t$, and show $$y_t=2$$.";

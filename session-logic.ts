@@ -783,28 +783,48 @@ export function imageSrcForPath(absPath: string): string {
   return pathToFileURL(absPath).href;
 }
 
+/** File types Obsidian opens itself, so a vault link to them can use openLinkText. */
+export const OBSIDIAN_OPENABLE_EXTENSIONS = new Set([
+  "md", "canvas", "base", "pdf",
+  "png", "jpg", "jpeg", "gif", "bmp", "svg", "webp", "avif",
+  "mp3", "wav", "m4a", "ogg", "flac", "3gp", "webm", "mp4", "ogv", "mov", "mkv",
+]);
+
+/** True when an href is an absolute filesystem path or a file:// URL. */
+export function isAbsoluteFileHref(href: string): boolean {
+  const raw = (href || "").trim();
+  return raw.startsWith("/") || raw.startsWith("file://");
+}
+
 /**
- * Recognize the narrow local-link shape emitted by Codex file citations.
+ * Recognize the local-link shape emitted by Codex file citations.
  *
- * Only absolute Markdown paths inside the current vault are accepted. Web
- * URLs, relative links, paths outside the vault, and non-Markdown files are
- * intentionally left for Obsidian's normal renderer.
+ * Accepts absolute paths and file:// URLs inside the current vault that point
+ * at a file type Obsidian opens, with or without a `:line` suffix. The path may
+ * be percent-encoded or already decoded: Obsidian classifies a link target
+ * without a colon as internal and decodes it into `data-href`. Web URLs,
+ * relative links, paths outside the vault, and other file types are left for
+ * Obsidian's normal renderer.
  */
-export function vaultMarkdownPathFromHref(href: string, vaultRoot: string): string | null {
+export function vaultFilePathFromHref(href: string, vaultRoot: string): string | null {
   const raw = (href || "").trim();
   if (!raw || !vaultRoot) return null;
 
   let candidate: string;
-  try {
-    if (raw.startsWith("file://")) {
+  if (raw.startsWith("file://")) {
+    try {
       candidate = fileURLToPath(raw);
-    } else if (raw.startsWith("/")) {
-      candidate = raw;
-    } else {
+    } catch {
       return null;
     }
-    candidate = decodeURIComponent(candidate);
-  } catch {
+  } else if (raw.startsWith("/")) {
+    try {
+      candidate = decodeURIComponent(raw);
+    } catch {
+      // Already decoded and containing a literal "%".
+      candidate = raw;
+    }
+  } else {
     return null;
   }
 
@@ -816,7 +836,8 @@ export function vaultMarkdownPathFromHref(href: string, vaultRoot: string): stri
   const target = resolve(candidate);
   const rel = relative(root, target);
   if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return null;
-  if (!rel.toLowerCase().endsWith(".md")) return null;
+  const ext = rel.includes(".") ? rel.slice(rel.lastIndexOf(".") + 1).toLowerCase() : "";
+  if (!OBSIDIAN_OPENABLE_EXTENSIONS.has(ext)) return null;
 
   return rel.split(sep).join("/");
 }

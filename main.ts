@@ -56,7 +56,8 @@ import {
   getImageOnlyPromptAndDisplay,
   imageSrcForPath,
   normalizeMathForObsidian,
-  vaultMarkdownPathFromHref,
+  vaultFilePathFromHref,
+  isAbsoluteFileHref,
   isImeCompositionEvent,
   type ContextChip,
 } from "./session-logic";
@@ -255,8 +256,8 @@ function enqueueRender(
       const latestState = renderStateMap.get(el);
       if (!latestState || latestState.version !== version || latestState.token !== token) return;
       attachMathSources(el, normalized.mathSources);
+      postProcessVaultLinks(el, app);
       postProcessWikilinks(el, app);
-      postProcessVaultMarkdownLinks(el, app);
     } catch {
       const latestState = renderStateMap.get(el);
       if (latestState && latestState.version === version && latestState.token === token) {
@@ -296,11 +297,18 @@ function postProcessWikilinks(el: HTMLElement, app: App): void {
   // Pass 1: Obsidian-generated internal-link anchors
   const anchors = el.querySelectorAll("a.internal-link");
   anchors.forEach((a) => {
+    // Absolute vault paths were already bound by postProcessVaultLinks.
+    if (a.hasAttribute(VAULT_LINK_ATTR)) return;
     const href = a.getAttribute("data-href") || a.getAttribute("href") || a.textContent || "";
     if (!href) return;
     a.addEventListener("click", (evt) => {
       evt.preventDefault();
       evt.stopPropagation();
+      // openLinkText on an absolute path would create a new empty note.
+      if (isAbsoluteFileHref(href)) {
+        new Notice(`Not a file in this vault: ${href}`);
+        return;
+      }
       app.workspace.openLinkText(href, "", "tab");
     });
   });
@@ -350,19 +358,25 @@ function postProcessWikilinks(el: HTMLElement, app: App): void {
   }
 }
 
+const VAULT_LINK_ATTR = "data-cx-vault-link";
+
 /**
- * Convert only existing vault Markdown file citations into Obsidian links.
- * External URLs and all other Markdown links remain untouched.
+ * Convert citations of existing vault files into Obsidian links.
+ *
+ * Obsidian marks a link target without a colon as internal, so
+ * `[x](</abs/vault/note.md>)` arrives as `a.internal-link` with the decoded
+ * absolute path in `data-href`, while `[x](/abs/vault/note.md:12)` arrives as
+ * an external link. Both shapes are handled here; this must run before
+ * postProcessWikilinks binds the raw href. Everything else is left untouched.
  */
-function postProcessVaultMarkdownLinks(el: HTMLElement, app: App): void {
+function postProcessVaultLinks(el: HTMLElement, app: App): void {
   const vaultRoot = (app.vault.adapter as any)?.basePath;
   if (!vaultRoot) return;
 
-  const anchors = el.querySelectorAll<HTMLAnchorElement>("a[href]");
+  const anchors = el.querySelectorAll<HTMLAnchorElement>("a[href], a[data-href]");
   anchors.forEach((anchor) => {
-    if (anchor.classList.contains("internal-link")) return;
-
-    const vaultPath = vaultMarkdownPathFromHref(anchor.getAttribute("href") || "", vaultRoot);
+    const href = anchor.getAttribute("data-href") || anchor.getAttribute("href") || "";
+    const vaultPath = vaultFilePathFromHref(href, vaultRoot);
     if (!vaultPath) return;
 
     const file = app.vault.getAbstractFileByPath(vaultPath);
@@ -373,6 +387,7 @@ function postProcessVaultMarkdownLinks(el: HTMLElement, app: App): void {
     anchor.removeAttribute("target");
     anchor.removeAttribute("rel");
     anchor.setAttribute("data-href", vaultPath);
+    anchor.setAttribute(VAULT_LINK_ATTR, "");
     anchor.addEventListener("click", (evt) => {
       evt.preventDefault();
       evt.stopPropagation();
