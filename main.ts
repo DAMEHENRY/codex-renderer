@@ -2081,9 +2081,12 @@ class CodexChatView extends ItemView {
       contextAttachments: cloneMessage(allChips),
     };
     this.messages.push(userMsg);
-    this.appendMessageEl(userMsg, this.messages.length - 1);
+    const userWrapper = this.appendMessageEl(userMsg, this.messages.length - 1);
 
     // Clear input and chips
+    const originalChips = cloneMessage(this.chips);
+    const originalSelection = this.preservedSelection;
+    const originalPdfSelection = this.preservedPdfSelection;
     this.inputEl.value = "";
     this.autoResizeInput();
     this.chips = [];
@@ -2133,6 +2136,8 @@ class CodexChatView extends ItemView {
     };
 
     let accumulatedText = "";
+    let hadError = false;
+    let busyMessage: string | null = null;
     let version = ++this.messageVersion;
 
     try {
@@ -2171,10 +2176,15 @@ class CodexChatView extends ItemView {
             break;
 
           case "error":
+            hadError = true;
             accumulatedText += `\n\n> ⚠️ ${evt.content}`;
             assistantMsg.content = accumulatedText;
             assistantMsg.displayContent = accumulatedText;
             this.renderAssistantMessage(assistantContent, accumulatedText, version);
+            break;
+
+          case "busy":
+            busyMessage = evt.content;
             break;
 
           case "cancelled":
@@ -2195,16 +2205,33 @@ class CodexChatView extends ItemView {
       }
 
       // Classify final status
-      if (assistantMsg.sendStatus === "cancelled") {
+      if (busyMessage) {
+        this.messages.splice(-2, 2);
+        userWrapper.remove();
+        assistantWrapper.remove();
+        this.messageVersion++;
+        const laterDraft = this.inputEl.value.trim();
+        this.inputEl.value = laterDraft ? `${rawText}\n\n${laterDraft}` : rawText;
+        this.autoResizeInput();
+        this.chips = originalChips;
+        this.preservedSelection = originalSelection;
+        this.preservedPdfSelection = originalPdfSelection;
+        this.renderChips();
+        new Notice(busyMessage, 8000);
+      } else if (assistantMsg.sendStatus === "cancelled") {
         // already handled
+      } else if (hadError) {
+        assistantMsg.sendStatus = "error";
+        userMsg.sendStatus = "error";
       } else if (accumulatedText) {
         assistantMsg.sendStatus = "success";
       } else {
         assistantMsg.sendStatus = "no-result";
       }
-      userMsg.sendStatus = "success";
+      if (!busyMessage && !hadError) userMsg.sendStatus = "success";
     } catch (err) {
       assistantMsg.sendStatus = "process-error";
+      userMsg.sendStatus = "process-error";
       const errMsg = err instanceof Error ? err.message : String(err);
       accumulatedText += `\n\n> ⚠️ Error: ${errMsg}`;
       assistantMsg.content = accumulatedText;

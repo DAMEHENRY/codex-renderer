@@ -14,6 +14,7 @@ import {
   resolveExecutablePath,
   parseCodexJsonlLine,
   classifyFinalStatus,
+  isThreadStoreConflict,
   parseModelsJson,
   type ParsedCodexEvent,
   type FinalStatus,
@@ -46,7 +47,7 @@ export interface SendPromptOpts {
 }
 
 export interface CodexStreamEvent {
-  type: "thread_started" | "text" | "error" | "done" | "turn_completed" | "cancelled" | "status";
+  type: "thread_started" | "text" | "error" | "done" | "turn_completed" | "cancelled" | "status" | "busy";
   content: string;
   threadId?: string;
   usage?: {
@@ -134,6 +135,12 @@ export async function* sendPrompt(
   opts: SendPromptOpts,
   vaultRoot: string,
 ): AsyncGenerator<CodexStreamEvent> {
+  if (activeChild) {
+    yield { type: "busy", content: "Codex is still responding in another chat pane. Check its reply before retrying; this message was not sent." };
+    yield { type: "done", content: "" };
+    return;
+  }
+
   let codexPath: string;
   try {
     codexPath = resolveCodexPath(settings.codexCliPath);
@@ -378,6 +385,12 @@ export async function* sendPrompt(
     timedOut,
     spawnFailed,
   });
+
+  if (isThreadStoreConflict(`${stderrBuf}\n${errorMessage}`)) {
+    yield { type: "busy", content: "This conversation is active in another Codex process. Check its latest reply, then retry after it finishes; this message was not sent." };
+    yield { type: "done", content: "" };
+    return;
+  }
 
   if (stderrBuf.trim() && status !== "success" && status !== "cancelled") {
     yield { type: "status", content: `stderr: ${stderrBuf.trim().slice(0, 500)}` };
