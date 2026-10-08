@@ -16,6 +16,7 @@ const {
   parseCodexJsonlLine,
   looksLikeInvalidResume,
   classifyFinalStatus,
+  isThreadStoreConflict,
   buildContextPrompt,
   truncateText,
   getSupportedFiles,
@@ -61,6 +62,9 @@ function assertDeepEqual(a, b, label) {
     console.error(`FAIL: ${label}\n  Expected: ${strB}\n  Got:      ${strA}`);
   }
 }
+
+assert(isThreadStoreConflict("thread-store conflict: thread 01a0d30c-df1d-7812-bfa1-7e6cf8020eec already has an active writer"), "detect active writer conflict");
+assert(!isThreadStoreConflict("request timed out"), "do not treat other errors as active writer conflicts");
 
 // ─── Composer IME handling ───────────────────────────────────────────────
 assert(isImeCompositionEvent({ isComposing: true, keyCode: 13 }), "IME composition blocks Enter");

@@ -489,6 +489,11 @@ export function isSelectionInsideContainer(
 
 export type FinalStatus = "success" | "cancelled" | "timeout" | "spawn-error" | "process-error" | "error" | "no-result";
 
+/** Codex permits only one writer for a persisted thread at a time. */
+export function isThreadStoreConflict(output: string): boolean {
+  return /thread-store conflict: thread [^\s]+ already has an active writer/i.test(output);
+}
+
 /**
  * Classify the final outcome of a Codex exec run.
  */

@@ -20,6 +20,14 @@ A thin Obsidian renderer UI for the official local [Codex CLI](https://github.co
 - **Approval policy**: `codex exec` does not accept the top-level `--ask-for-approval` flag, so the renderer does not pass approval-policy arguments. It also never uses dangerous overrides like `--dangerously-bypass-approvals-and-sandbox`.
 - **Renderer environment parity**: When Obsidian is launched from the macOS GUI, its environment may omit the merged ChatGPT app, legacy Codex.app, Codex primary runtime, and Homebrew paths. The renderer searches and prepends both `/Applications/ChatGPT.app/Contents/Resources` and the legacy Codex.app location before spawning the CLI, while retaining the other common tool paths. Desktop-only app tools such as Browser, Chrome, Computer Use, and image generation remain desktop capabilities, not renderer-provided CLI tools.
 
+## Rewind and edit
+
+Click **Rewind & edit** below any of your messages after Codex finishes replying. The chat returns to just before that message, and its text, images, file context, selections, and quotations return to the composer. Edit it and send again.
+
+The renderer uses the official Codex app-server to match saved prompts to turn IDs and fork only the preceding history. The original conversation stays in **History**, and the new conversation is labelled **Rewind branch**. Rewinding the first message starts a fresh session on the next send. Existing drafts must be sent or cleared before rewinding.
+
+This rewinds conversation context only; it keeps any file changes and other actions already performed. It never rewrites official Codex session files. If the installed CLI cannot fork at the requested boundary, or saved history differs from the displayed chat, rewind fails without changing the current chat or draft. Recent CLI versions with paginated history are supported; older versions must support `thread/fork` with `lastTurnId`.
+
 ## Development
 
 ```bash
