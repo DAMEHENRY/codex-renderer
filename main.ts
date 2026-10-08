@@ -32,6 +32,7 @@ import {
   isCodexRunning,
   resolveCodexPath,
   fetchModelCatalog,
+  rewindConversation,
   type CodexBridgeSettings,
   type CodexStreamEvent,
 } from "./codex-bridge";
@@ -61,6 +62,7 @@ import {
   isImeCompositionEvent,
   type ContextChip,
 } from "./session-logic";
+import { getRewindDraft } from "./rewind-logic";
 
 /* ================================================================== */
 /*  Constants                                                         */
@@ -126,6 +128,7 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   displayContent: string;
+  composerText?: string;
   timestamp: number;
   sendStatus: SendStatus;
   contextAttachments: ContextChip[];
@@ -153,6 +156,7 @@ interface Conversation {
   updatedAt: number;
   lastModel: string;
   lastEffort?: string;
+  rewindSourceId?: string;
   messages: ChatMessage[];
 }
 
@@ -860,6 +864,7 @@ class HistoryModal extends Modal {
       if (conv.lastModel) {
         meta.createEl("span", { text: conv.lastModel, cls: "cx-history-model" });
       }
+      if (conv.rewindSourceId) meta.createEl("span", { text: "Rewind branch", cls: "cx-history-model" });
 
       const cmdRow = info.createDiv({ cls: "cx-history-cmd-row" });
       cmdRow.createEl("span", { text: `ID: ${conv.sessionId.slice(0, 8)}`, cls: "cx-history-session-id" });
@@ -998,6 +1003,8 @@ class CodexChatView extends ItemView {
   private preservedSelection: { text: string; path: string; lines: string } | null = null;
   private preservedPdfSelection: { text: string; path: string; page: string } | null = null;
   private isStreaming = false;
+  private isRewinding = false;
+  private rewindSourceId: string | undefined;
   private sessionId: string | null = null;
   private mentionQuery = "";
   private mentionIndex = 0;
@@ -1191,6 +1198,7 @@ class CodexChatView extends ItemView {
   }
 
   async onClose(): Promise<void> {
+    if (this.isRewinding) this.messageVersion++;
     if (this.selectionInterval) clearInterval(this.selectionInterval);
     if (this.continuityCaptureOpen && this.continuityCaptureCancelPath) {
       this.continuityCaptureCancelled = true;
@@ -1946,6 +1954,7 @@ class CodexChatView extends ItemView {
   /* ------------------------------------------------------------------ */
 
   private async handlePaste(evt: ClipboardEvent): Promise<void> {
+    if (this.isRewinding) return;
     const items = evt.clipboardData?.items;
     if (!items) return;
     for (let i = 0; i < items.length; i++) {
@@ -1961,6 +1970,7 @@ class CodexChatView extends ItemView {
   }
 
   private async handleDrop(evt: DragEvent): Promise<void> {
+    if (this.isRewinding) return;
     const files = evt.dataTransfer?.files;
     if (!files) return;
     for (let i = 0; i < files.length; i++) {
@@ -1977,11 +1987,15 @@ class CodexChatView extends ItemView {
   /* ------------------------------------------------------------------ */
 
   private async handleSend(): Promise<void> {
-    if (this.isStreaming) return;
+    if (this.isStreaming || this.isRewinding) return;
     this.hideQuotePopover();
     const rawText = this.inputEl.value.trim();
     const hasImages = this.chips.some(c => c.type === "image");
     if (!rawText && !hasImages) return;
+
+    // Lock the conversation before asynchronous context reads begin.
+    this.isStreaming = true;
+    this.setStreamingUI(true);
 
     const { prompt: promptToSend, displayContent } = getImageOnlyPromptAndDisplay(hasImages, rawText);
 
@@ -2076,6 +2090,7 @@ class CodexChatView extends ItemView {
       role: "user",
       content: fullPrompt,
       displayContent: displayContent,
+      composerText: rawText,
       timestamp: Date.now(),
       sendStatus: "pending",
       contextAttachments: cloneMessage(allChips),
@@ -2251,11 +2266,75 @@ class CodexChatView extends ItemView {
     this.showStatus("Cancelling…");
   }
 
+  private async handleRewind(index: number): Promise<void> {
+    if (this.isStreaming || this.isRewinding || isCodexRunning()) {
+      new Notice("Wait for Codex to finish before rewinding.");
+      return;
+    }
+    const selected = this.messages[index];
+    if (selected?.role !== "user") return;
+    if (this.inputEl.value.trim() || this.chips.length || this.continuityCaptureOpen) {
+      new Notice("Save, send, or clear your current draft before rewinding.");
+      return;
+    }
+    const sourceId = this.sessionId;
+    const version = this.messageVersion;
+    const draft = getRewindDraft(selected);
+    this.isRewinding = true;
+    this.setStreamingUI(false);
+    this.showStatus("Rewinding…");
+    try {
+      let forkId: string | null = null;
+      if (sourceId) {
+        forkId = await rewindConversation(
+          this.plugin.settings.codexCliPath,
+          (this.app.vault.adapter as any).basePath || "",
+          sourceId, this.messages, index,
+        );
+      } else if (index !== 0) {
+        throw new Error("This conversation has no saved Codex session to rewind.");
+      }
+      if (version !== this.messageVersion || sourceId !== this.sessionId) return;
+      // Context-menu and native import callbacks may have added a draft while awaiting Codex.
+      if (this.inputEl.value.trim() || this.chips.length) {
+        new Notice("Your draft changed while rewinding. It has been kept; retry after clearing it.");
+        return;
+      }
+      this.messageVersion++;
+      this.messages = cloneMessage(this.messages.slice(0, index));
+      this.sessionId = forkId;
+      this.rewindSourceId = sourceId || undefined;
+      this.chips = draft.chips;
+      this.preservedSelection = null;
+      this.preservedPdfSelection = null;
+      this.hideQuotePopover();
+      this.chatEl.empty();
+      this.welcomeEl = this.chatEl.createDiv({ cls: "cx-welcome" });
+      this.welcomeEl.style.display = "none";
+      for (let i = 0; i < this.messages.length; i++) this.appendMessageEl(this.messages[i], i);
+      this.inputEl.value = draft.text;
+      this.autoResizeInput();
+      this.renderChips();
+      this.scrollToBottom();
+      this.saveCurrentConversation();
+      this.plugin.historyStore.flushNow();
+      new Notice("Rewound. Edit your message and send again. The original conversation remains in History. File changes are kept.", 7000);
+    } catch (error) {
+      new Notice(error instanceof Error ? error.message : String(error), 8000);
+    } finally {
+      this.isRewinding = false;
+      this.setStreamingUI(this.isStreaming);
+      this.showStatus("");
+      this.inputEl.focus();
+    }
+  }
+
   /* ------------------------------------------------------------------ */
   /*  New Chat                                                          */
   /* ------------------------------------------------------------------ */
 
   private handleNewChat(): void {
+    if (this.isRewinding) return;
     if (this.isStreaming) {
       killCodexProcess();
     }
@@ -2263,6 +2342,7 @@ class CodexChatView extends ItemView {
     this.messages = [];
     this.chips = [];
     this.sessionId = null;
+    this.rewindSourceId = undefined;
     this.preservedSelection = null;
     this.preservedPdfSelection = null;
     this.hideQuotePopover();
@@ -2284,6 +2364,7 @@ class CodexChatView extends ItemView {
   /* ------------------------------------------------------------------ */
 
   private showHistory(): void {
+    if (this.isRewinding) return;
     const conversations = this.plugin.historyStore.getConversations();
     const modal = new HistoryModal(
       this.app,
@@ -2295,10 +2376,12 @@ class CodexChatView extends ItemView {
   }
 
   private restoreConversation(conv: Conversation): void {
+    if (this.isRewinding) return;
     if (this.isStreaming) killCodexProcess();
     this.messageVersion++;
     this.messages = cloneMessage(conv.messages);
     this.sessionId = conv.sessionId;
+    this.rewindSourceId = conv.rewindSourceId;
     this.chips = [];
     this.preservedSelection = null;
     this.preservedPdfSelection = null;
@@ -2355,6 +2438,7 @@ class CodexChatView extends ItemView {
       updatedAt: Date.now(),
       lastModel: this.modelSelect.value,
       lastEffort: this.effortSelect.value,
+      rewindSourceId: this.rewindSourceId,
       messages: cloneMessage(this.messages),
     };
 
@@ -2362,6 +2446,9 @@ class CodexChatView extends ItemView {
       all[existing] = conv;
     } else {
       all.unshift(conv);
+      // Keep the original next to its new branch, including at the cache size limit.
+      const sourceIndex = all.findIndex((entry) => entry.sessionId === this.rewindSourceId);
+      if (sourceIndex > 1) all.splice(1, 0, all.splice(sourceIndex, 1)[0]);
     }
 
     // Trim to max
@@ -2374,7 +2461,7 @@ class CodexChatView extends ItemView {
   /*  DOM helpers                                                       */
   /* ------------------------------------------------------------------ */
 
-  private appendMessageEl(msg: ChatMessage, _index: number): HTMLDivElement {
+  private appendMessageEl(msg: ChatMessage, index: number): HTMLDivElement {
     if (this.welcomeEl) this.welcomeEl.style.display = "none";
 
     const wrapper = this.chatEl.createDiv({
@@ -2389,6 +2476,11 @@ class CodexChatView extends ItemView {
       }
       const content = wrapper.createDiv({ cls: "cx-message-content" });
       content.setText(msg.displayContent);
+      const rewindBtn = wrapper.createEl("button", { cls: "cx-rewind-btn", text: "Rewind & edit" });
+      rewindBtn.title = "Return to before this message and edit it. The original chat and file changes are kept.";
+      rewindBtn.setAttribute("aria-label", "Rewind to this message and edit");
+      rewindBtn.disabled = this.isStreaming || this.isRewinding;
+      rewindBtn.addEventListener("click", () => { void this.handleRewind(index); });
     } else {
       const content = wrapper.createDiv({ cls: "cx-message-content" });
       if (msg.displayContent) {
@@ -2430,11 +2522,15 @@ class CodexChatView extends ItemView {
   private setStreamingUI(streaming: boolean): void {
     this.sendBtn.style.display = streaming ? "none" : "";
     this.cancelBtn.style.display = streaming ? "" : "none";
-    this.inputEl.disabled = false;
-    this.newChatBtn.disabled = streaming;
-    this.modelMenuBtn.disabled = streaming;
-    this.effortMenuBtn.disabled = streaming;
-    if (streaming) this.closeOptionMenus();
+    const busy = streaming || this.isRewinding;
+    this.inputEl.disabled = this.isRewinding;
+    this.sendBtn.disabled = this.isRewinding;
+    this.newChatBtn.disabled = busy;
+    this.historyBtn.disabled = busy;
+    this.modelMenuBtn.disabled = busy;
+    this.effortMenuBtn.disabled = busy;
+    this.chatEl.querySelectorAll<HTMLButtonElement>(".cx-rewind-btn").forEach((button) => { button.disabled = busy; });
+    if (busy) this.closeOptionMenus();
   }
 
   private toggleOptionMenu(kind: "model" | "effort"): void {

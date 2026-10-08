@@ -8,6 +8,8 @@
 import { spawn, exec, ChildProcess } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { forkBeforeMessage } from "./codex-session";
+import { type RewindMessage } from "./rewind-logic";
 import {
   buildCodexExecArgs,
   buildCodexChildPath,
@@ -120,6 +122,22 @@ export function killCodexProcess(): void {
 
 export function isCodexRunning(): boolean {
   return activeChild !== null;
+}
+
+export async function rewindConversation(
+  codexCliPath: string, vaultRoot: string, sessionId: string,
+  messages: RewindMessage[], index: number,
+): Promise<string | null> {
+  if (activeChild) throw new Error("Wait for Codex to finish in all chat panes before rewinding.");
+  try {
+    return await forkBeforeMessage({
+      executable: resolveCodexPath(codexCliPath), env: buildCodexChildEnv(),
+      vaultRoot, sessionId, messages, index,
+      onSpawn: (child) => { activeChild = child; },
+    });
+  } finally {
+    activeChild = null;
+  }
 }
 
 /* ------------------------------------------------------------------ */

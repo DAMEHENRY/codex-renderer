@@ -112,6 +112,27 @@
   overflow-wrap: break-word;
 }
 
+.codex-renderer-view .cx-rewind-btn {
+  height: auto;
+  padding: 2px 6px;
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.codex-renderer-view .cx-rewind-btn:hover:not(:disabled) {
+  color: var(--text-normal);
+  background: var(--background-modifier-hover);
+}
+
+.codex-renderer-view .cx-rewind-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 .cx-message-user {
   display: flex;
   flex-direction: column;
