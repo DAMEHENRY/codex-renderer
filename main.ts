@@ -494,6 +494,9 @@ export default class CodexRendererPlugin extends Plugin {
   }
 
   onunload(): void {
+    // Stop every Codex child this plugin started, so disabling or reloading
+    // the plugin never leaves a codex process running in the background.
+    killCodexProcess();
     if (this.historyStore) {
       this.historyStore.flushNow();
     }
@@ -1199,7 +1202,13 @@ class CodexChatView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.isRewinding) this.messageVersion++;
+    // Closing the pane stops its reply; the partial answer is still saved to history.
+    if (this.isStreaming) killCodexProcess(this);
     if (this.selectionInterval) clearInterval(this.selectionInterval);
+    if (this.quoteSelectionTimer) {
+      window.clearTimeout(this.quoteSelectionTimer);
+      this.quoteSelectionTimer = null;
+    }
     if (this.continuityCaptureOpen && this.continuityCaptureCancelPath) {
       this.continuityCaptureCancelled = true;
       try {
@@ -2160,6 +2169,7 @@ class CodexChatView extends ItemView {
         prompt: fullPrompt,
         sessionId: this.sessionId || undefined,
         imagePaths,
+        owner: this,
       }, vaultRoot);
 
       for await (const evt of stream) {
@@ -2262,12 +2272,12 @@ class CodexChatView extends ItemView {
   }
 
   private handleCancel(): void {
-    killCodexProcess();
+    killCodexProcess(this);
     this.showStatus("Cancelling…");
   }
 
   private async handleRewind(index: number): Promise<void> {
-    if (this.isStreaming || this.isRewinding || isCodexRunning()) {
+    if (this.isStreaming || this.isRewinding || isCodexRunning(this)) {
       new Notice("Wait for Codex to finish before rewinding.");
       return;
     }
@@ -2289,7 +2299,7 @@ class CodexChatView extends ItemView {
         forkId = await rewindConversation(
           this.plugin.settings.codexCliPath,
           (this.app.vault.adapter as any).basePath || "",
-          sourceId, this.messages, index,
+          sourceId, this.messages, index, this,
         );
       } else if (index !== 0) {
         throw new Error("This conversation has no saved Codex session to rewind.");
@@ -2336,7 +2346,7 @@ class CodexChatView extends ItemView {
   private handleNewChat(): void {
     if (this.isRewinding) return;
     if (this.isStreaming) {
-      killCodexProcess();
+      killCodexProcess(this);
     }
     this.messageVersion++;
     this.messages = [];
@@ -2377,7 +2387,7 @@ class CodexChatView extends ItemView {
 
   private restoreConversation(conv: Conversation): void {
     if (this.isRewinding) return;
-    if (this.isStreaming) killCodexProcess();
+    if (this.isStreaming) killCodexProcess(this);
     this.messageVersion++;
     this.messages = cloneMessage(conv.messages);
     this.sessionId = conv.sessionId;

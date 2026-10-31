@@ -46,6 +46,7 @@ export interface SendPromptOpts {
   prompt: string;
   sessionId?: string;   // undefined for new chat, UUID for resume
   imagePaths?: string[];
+  owner?: object;       // the chat pane; each pane may run one request at a time
 }
 
 export interface CodexStreamEvent {
@@ -99,44 +100,69 @@ export function resolveCodexPath(configuredPath: string, env: NodeJS.ProcessEnv 
 /*  Process management                                                */
 /* ------------------------------------------------------------------ */
 
-let activeChild: ChildProcess | null = null;
+/**
+ * Running Codex children, keyed by the chat pane that owns them.
+ * Each pane can run its own request; two panes may not write the same session.
+ */
+interface ActiveRun { child: ChildProcess; sessionId?: string }
+const activeRuns = new Map<object, ActiveRun>();
+const GLOBAL_OWNER = {};
 
-export function killCodexProcess(): void {
-  if (!activeChild) return;
+function killChild(child: ChildProcess): void {
   try {
-    activeChild.kill("SIGTERM");
+    child.kill("SIGTERM");
   } catch {
     // ignore
   }
   // Force kill after 3 seconds if still alive
-  const child = activeChild;
   setTimeout(() => {
     try {
-      if (child && !child.killed) child.kill("SIGKILL");
+      if (!child.killed) child.kill("SIGKILL");
     } catch {
       // ignore
     }
   }, 3000);
-  activeChild = null;
 }
 
-export function isCodexRunning(): boolean {
-  return activeChild !== null;
+/** Kill the process owned by `owner`, or every process when no owner is given. */
+export function killCodexProcess(owner?: object): void {
+  if (owner === undefined) {
+    for (const run of activeRuns.values()) killChild(run.child);
+    activeRuns.clear();
+    return;
+  }
+  const run = activeRuns.get(owner);
+  if (!run) return;
+  killChild(run.child);
+  activeRuns.delete(owner);
+}
+
+/** True when `owner` has a running process, or any pane does when no owner is given. */
+export function isCodexRunning(owner?: object): boolean {
+  return owner === undefined ? activeRuns.size > 0 : activeRuns.has(owner);
+}
+
+function isSessionRunning(sessionId: string | undefined): boolean {
+  if (!sessionId) return false;
+  for (const run of activeRuns.values()) if (run.sessionId === sessionId) return true;
+  return false;
 }
 
 export async function rewindConversation(
   codexCliPath: string, vaultRoot: string, sessionId: string,
-  messages: RewindMessage[], index: number,
+  messages: RewindMessage[], index: number, owner: object = GLOBAL_OWNER,
 ): Promise<string | null> {
-  if (activeChild) throw new Error("Wait for Codex to finish in all chat panes before rewinding.");
+  if (activeRuns.has(owner) || isSessionRunning(sessionId)) {
+    throw new Error("Wait for Codex to finish this conversation before rewinding.");
+  }
   try {
     return await forkBeforeMessage({
       executable: resolveCodexPath(codexCliPath), env: buildCodexChildEnv(),
       vaultRoot, sessionId, messages, index,
-      onSpawn: (child) => { activeChild = child; },
+      onSpawn: (child) => { activeRuns.set(owner, { child, sessionId }); },
     });
   } finally {
-    activeChild = null;
+    activeRuns.delete(owner);
   }
 }
 
@@ -146,15 +172,21 @@ export async function rewindConversation(
 
 /**
  * Spawn codex exec, write prompt to stdin, and yield parsed events.
- * Caller is responsible for only calling once at a time.
+ * Each owner may run one request at a time; different owners run in parallel.
  */
 export async function* sendPrompt(
   settings: CodexBridgeSettings,
   opts: SendPromptOpts,
   vaultRoot: string,
 ): AsyncGenerator<CodexStreamEvent> {
-  if (activeChild) {
-    yield { type: "busy", content: "Codex is still responding in another chat pane. Check its reply before retrying; this message was not sent." };
+  const owner = opts.owner ?? GLOBAL_OWNER;
+  if (activeRuns.has(owner)) {
+    yield { type: "busy", content: "Codex is still responding in this chat pane. Wait for its reply before retrying; this message was not sent." };
+    yield { type: "done", content: "" };
+    return;
+  }
+  if (isSessionRunning(opts.sessionId)) {
+    yield { type: "busy", content: "This conversation is still running in another chat pane. Check its reply before retrying; this message was not sent." };
     yield { type: "done", content: "" };
     return;
   }
@@ -196,7 +228,7 @@ export async function* sendPrompt(
     return;
   }
 
-  activeChild = child;
+  activeRuns.set(owner, { child, sessionId: opts.sessionId });
 
   // Write prompt to stdin and close
   try {
@@ -207,7 +239,7 @@ export async function* sendPrompt(
       type: "error",
       content: `Failed to write to Codex stdin: ${err instanceof Error ? err.message : String(err)}`,
     };
-    killCodexProcess();
+    killCodexProcess(owner);
     yield { type: "done", content: "" };
     return;
   }
@@ -227,7 +259,7 @@ export async function* sendPrompt(
   if (timeoutMs > 0) {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      killCodexProcess();
+      killCodexProcess(owner);
     }, timeoutMs);
   }
 
@@ -244,7 +276,7 @@ export async function* sendPrompt(
   if (!stdout) {
     yield { type: "error", content: "No stdout from Codex CLI" };
     yield { type: "done", content: "" };
-    activeChild = null;
+    activeRuns.delete(owner);
     return;
   }
 
@@ -390,7 +422,7 @@ export async function* sendPrompt(
   });
 
   if (timeoutHandle) clearTimeout(timeoutHandle);
-  activeChild = null;
+  if (activeRuns.get(owner)?.child === child) activeRuns.delete(owner);
 
   // Yield final status
   const status: FinalStatus = classifyFinalStatus({
