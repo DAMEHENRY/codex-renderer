@@ -34,7 +34,6 @@ import {
   fetchModelCatalog,
   rewindConversation,
   type CodexBridgeSettings,
-  type CodexStreamEvent,
 } from "./codex-bridge";
 import {
   buildContextPrompt,
@@ -63,6 +62,7 @@ import {
   type ContextChip,
 } from "./session-logic";
 import { getRewindDraft } from "./rewind-logic";
+import { buildHarnessHandoff, DEEPSEEK_HARNESS_PATH, DEEPSEEK_MODEL } from "./deepseek-harness";
 
 /* ================================================================== */
 /*  Constants                                                         */
@@ -100,6 +100,7 @@ export interface CodexRendererSettings {
   sandboxMode: string;
   approvalPolicy: string;
   requestTimeoutMinutes: number;
+  deepSeekFallback: boolean;
   maxFileContextChars: number;
   maxTotalContextChars: number;
   viewPlacement: string;
@@ -115,6 +116,7 @@ const DEFAULT_SETTINGS: CodexRendererSettings = {
   sandboxMode: "workspace-write",
   approvalPolicy: "never",
   requestTimeoutMinutes: 20,
+  deepSeekFallback: false,
   maxFileContextChars: 20000,
   maxTotalContextChars: 100000,
   viewPlacement: "right",
@@ -129,6 +131,7 @@ interface ChatMessage {
   content: string;
   displayContent: string;
   composerText?: string;
+  deepSeek?: boolean;
   timestamp: number;
   sendStatus: SendStatus;
   contextAttachments: ContextChip[];
@@ -151,6 +154,8 @@ type SendStatus =
 
 interface Conversation {
   sessionId: string;
+  deepSeek?: boolean;
+  fallbackSourceId?: string;
   title: string;
   createdAt: number;
   updatedAt: number;
@@ -494,6 +499,9 @@ export default class CodexRendererPlugin extends Plugin {
   }
 
   onunload(): void {
+    // Stop every Codex child this plugin started, so disabling or reloading
+    // the plugin never leaves a codex process running in the background.
+    killCodexProcess();
     if (this.historyStore) {
       this.historyStore.flushNow();
     }
@@ -671,6 +679,16 @@ class CodexRendererSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           }),
       );
+
+    new Setting(containerEl)
+      .setName("DeepSeek Harness fallback")
+      .setDesc("On a Codex connection failure before any reply or tool run, send the request, supported images and recent chat text to your signed-in DeepSeek account. Follow-ups in that chat use DeepSeek.")
+      .addToggle((toggle) => toggle
+        .setValue(this.plugin.settings.deepSeekFallback)
+        .onChange(async (value) => {
+          this.plugin.settings.deepSeekFallback = value;
+          await this.plugin.saveSettings();
+        }));
 
     new Setting(containerEl)
       .setName("Model presets")
@@ -861,7 +879,9 @@ class HistoryModal extends Modal {
       info.createEl("span", { text: conv.title, cls: "cx-history-title" });
       const meta = info.createDiv({ cls: "cx-history-meta" });
       meta.createEl("span", { text: formatRelativeDate(conv.updatedAt) });
-      if (conv.lastModel) {
+      if (conv.deepSeek) {
+        meta.createEl("span", { text: "DeepSeek Harness", cls: "cx-history-model" });
+      } else if (conv.lastModel) {
         meta.createEl("span", { text: conv.lastModel, cls: "cx-history-model" });
       }
       if (conv.rewindSourceId) meta.createEl("span", { text: "Rewind branch", cls: "cx-history-model" });
@@ -869,21 +889,23 @@ class HistoryModal extends Modal {
       const cmdRow = info.createDiv({ cls: "cx-history-cmd-row" });
       cmdRow.createEl("span", { text: `ID: ${conv.sessionId.slice(0, 8)}`, cls: "cx-history-session-id" });
       
-      const copyBtn = cmdRow.createEl("button", { text: "Copy Resume", cls: "cx-history-copy-btn" });
-      copyBtn.addEventListener("click", (evt) => {
-        evt.stopPropagation();
-        const cmd = `codex exec resume ${conv.sessionId} "prompt"`;
-        navigator.clipboard.writeText(cmd);
-        new Notice("Copied resume command!");
-      });
+      if (!conv.deepSeek) {
+        const copyBtn = cmdRow.createEl("button", { text: "Copy Resume", cls: "cx-history-copy-btn" });
+        copyBtn.addEventListener("click", (evt) => {
+          evt.stopPropagation();
+          const cmd = `codex exec resume ${conv.sessionId} "prompt"`;
+          navigator.clipboard.writeText(cmd);
+          new Notice("Copied resume command!");
+        });
 
-      const copyBtn2 = cmdRow.createEl("button", { text: "Copy CLI Resume", cls: "cx-history-copy-btn" });
-      copyBtn2.addEventListener("click", (evt) => {
-        evt.stopPropagation();
-        const cmd = `codex resume --include-non-interactive ${conv.sessionId}`;
-        navigator.clipboard.writeText(cmd);
-        new Notice("Copied CLI resume command!");
-      });
+        const copyBtn2 = cmdRow.createEl("button", { text: "Copy CLI Resume", cls: "cx-history-copy-btn" });
+        copyBtn2.addEventListener("click", (evt) => {
+          evt.stopPropagation();
+          const cmd = `codex resume --include-non-interactive ${conv.sessionId}`;
+          navigator.clipboard.writeText(cmd);
+          new Notice("Copied CLI resume command!");
+        });
+      }
 
       const trashBtn = row.createEl("button", {
         cls: "cx-history-trash",
@@ -1006,6 +1028,8 @@ class CodexChatView extends ItemView {
   private isRewinding = false;
   private rewindSourceId: string | undefined;
   private sessionId: string | null = null;
+  private deepSeek = false;
+  private fallbackSourceId?: string;
   private mentionQuery = "";
   private mentionIndex = 0;
   private mentionResults: Array<{ path: string; name: string; extension: string }> = [];
@@ -1199,7 +1223,13 @@ class CodexChatView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.isRewinding) this.messageVersion++;
+    // Closing the pane stops its reply; the partial answer is still saved to history.
+    if (this.isStreaming) killCodexProcess(this);
     if (this.selectionInterval) clearInterval(this.selectionInterval);
+    if (this.quoteSelectionTimer) {
+      window.clearTimeout(this.quoteSelectionTimer);
+      this.quoteSelectionTimer = null;
+    }
     if (this.continuityCaptureOpen && this.continuityCaptureCancelPath) {
       this.continuityCaptureCancelled = true;
       try {
@@ -2148,18 +2178,24 @@ class CodexChatView extends ItemView {
       sandboxMode: this.plugin.settings.sandboxMode,
       approvalPolicy: this.plugin.settings.approvalPolicy,
       requestTimeoutMinutes: this.plugin.settings.requestTimeoutMinutes,
+      deepSeekFallback: this.plugin.settings.deepSeekFallback,
+      deepSeekHarnessPath: DEEPSEEK_HARNESS_PATH,
     };
 
     let accumulatedText = "";
     let hadError = false;
     let busyMessage: string | null = null;
-    let version = ++this.messageVersion;
+    const version = ++this.messageVersion;
+    const originalSessionId = this.sessionId;
 
     try {
       const stream = sendPrompt(bridgeSettings, {
         prompt: fullPrompt,
-        sessionId: this.sessionId || undefined,
+        sessionId: originalSessionId || undefined,
+        deepSeekSession: this.deepSeek,
+        fallbackPrompt: () => buildHarnessHandoff(this.messages.slice(0, assistantIdx - 1), fullPrompt),
         imagePaths,
+        owner: this,
       }, vaultRoot);
 
       for await (const evt of stream) {
@@ -2169,6 +2205,16 @@ class CodexChatView extends ItemView {
           case "thread_started":
             if (evt.threadId) {
               this.sessionId = evt.threadId;
+              if (evt.deepSeek) {
+                if (!this.deepSeek) {
+                  this.fallbackSourceId = originalSessionId || undefined;
+                  this.rewindSourceId = undefined;
+                }
+                this.deepSeek = true;
+                assistantMsg.deepSeek = true;
+                this.labelDeepSeekReply(assistantWrapper);
+                this.updateOptionButtonLabels();
+              }
             }
             break;
 
@@ -2262,12 +2308,13 @@ class CodexChatView extends ItemView {
   }
 
   private handleCancel(): void {
-    killCodexProcess();
+    killCodexProcess(this);
     this.showStatus("Cancelling…");
   }
 
   private async handleRewind(index: number): Promise<void> {
-    if (this.isStreaming || this.isRewinding || isCodexRunning()) {
+    if (this.deepSeek) return;
+    if (this.isStreaming || this.isRewinding || isCodexRunning(this)) {
       new Notice("Wait for Codex to finish before rewinding.");
       return;
     }
@@ -2289,7 +2336,7 @@ class CodexChatView extends ItemView {
         forkId = await rewindConversation(
           this.plugin.settings.codexCliPath,
           (this.app.vault.adapter as any).basePath || "",
-          sourceId, this.messages, index,
+          sourceId, this.messages, index, this,
         );
       } else if (index !== 0) {
         throw new Error("This conversation has no saved Codex session to rewind.");
@@ -2336,12 +2383,15 @@ class CodexChatView extends ItemView {
   private handleNewChat(): void {
     if (this.isRewinding) return;
     if (this.isStreaming) {
-      killCodexProcess();
+      killCodexProcess(this);
     }
     this.messageVersion++;
     this.messages = [];
     this.chips = [];
     this.sessionId = null;
+    this.deepSeek = false;
+    this.fallbackSourceId = undefined;
+    this.updateOptionButtonLabels();
     this.rewindSourceId = undefined;
     this.preservedSelection = null;
     this.preservedPdfSelection = null;
@@ -2377,10 +2427,12 @@ class CodexChatView extends ItemView {
 
   private restoreConversation(conv: Conversation): void {
     if (this.isRewinding) return;
-    if (this.isStreaming) killCodexProcess();
+    if (this.isStreaming) killCodexProcess(this);
     this.messageVersion++;
     this.messages = cloneMessage(conv.messages);
     this.sessionId = conv.sessionId;
+    this.deepSeek = conv.deepSeek === true;
+    this.fallbackSourceId = conv.fallbackSourceId;
     this.rewindSourceId = conv.rewindSourceId;
     this.chips = [];
     this.preservedSelection = null;
@@ -2413,6 +2465,7 @@ class CodexChatView extends ItemView {
     this.renderModelMenu();
     this.renderEffortMenu();
     this.updateOptionButtonLabels();
+    this.setStreamingUI(this.isStreaming);
   }
 
   private deleteConversation(conv: Conversation): void {
@@ -2433,6 +2486,8 @@ class CodexChatView extends ItemView {
 
     const conv: Conversation = {
       sessionId: this.sessionId,
+      deepSeek: this.deepSeek || undefined,
+      fallbackSourceId: this.fallbackSourceId,
       title: generateTitle(this.messages[0]?.displayContent || ""),
       createdAt: this.messages[0]?.timestamp || Date.now(),
       updatedAt: Date.now(),
@@ -2447,7 +2502,7 @@ class CodexChatView extends ItemView {
     } else {
       all.unshift(conv);
       // Keep the original next to its new branch, including at the cache size limit.
-      const sourceIndex = all.findIndex((entry) => entry.sessionId === this.rewindSourceId);
+      const sourceIndex = all.findIndex((entry) => entry.sessionId === (this.fallbackSourceId || this.rewindSourceId));
       if (sourceIndex > 1) all.splice(1, 0, all.splice(sourceIndex, 1)[0]);
     }
 
@@ -2480,8 +2535,10 @@ class CodexChatView extends ItemView {
       rewindBtn.title = "Return to before this message and edit it. The original chat and file changes are kept.";
       rewindBtn.setAttribute("aria-label", "Rewind to this message and edit");
       rewindBtn.disabled = this.isStreaming || this.isRewinding;
+      if (this.deepSeek) rewindBtn.style.display = "none";
       rewindBtn.addEventListener("click", () => { void this.handleRewind(index); });
     } else {
+      if (msg.deepSeek) this.labelDeepSeekReply(wrapper);
       const content = wrapper.createDiv({ cls: "cx-message-content" });
       if (msg.displayContent) {
         this.renderAssistantMessage(content, msg.displayContent, this.messageVersion);
@@ -2489,6 +2546,10 @@ class CodexChatView extends ItemView {
     }
 
     return wrapper;
+  }
+
+  private labelDeepSeekReply(wrapper: HTMLDivElement): void {
+    wrapper.prepend(wrapper.createDiv({ cls: "cx-history-model", text: "DeepSeek Harness" }));
   }
 
   private getMessageContentEl(wrapper: HTMLDivElement): HTMLDivElement {
@@ -2527,9 +2588,12 @@ class CodexChatView extends ItemView {
     this.sendBtn.disabled = this.isRewinding;
     this.newChatBtn.disabled = busy;
     this.historyBtn.disabled = busy;
-    this.modelMenuBtn.disabled = busy;
-    this.effortMenuBtn.disabled = busy;
-    this.chatEl.querySelectorAll<HTMLButtonElement>(".cx-rewind-btn").forEach((button) => { button.disabled = busy; });
+    this.modelMenuBtn.disabled = busy || this.deepSeek;
+    this.effortMenuBtn.disabled = busy || this.deepSeek;
+    this.chatEl.querySelectorAll<HTMLButtonElement>(".cx-rewind-btn").forEach((button) => {
+      button.disabled = busy;
+      button.style.display = this.deepSeek ? "none" : "";
+    });
     if (busy) this.closeOptionMenus();
   }
 
@@ -2595,8 +2659,8 @@ class CodexChatView extends ItemView {
   }
 
   private updateOptionButtonLabels(): void {
-    const modelLabel = this.modelSelect.selectedOptions[0]?.text || "Default";
-    const effortLabel = this.effortSelect.selectedOptions[0]?.text || "Effort: Default";
+    const modelLabel = this.deepSeek ? DEEPSEEK_MODEL : this.modelSelect.selectedOptions[0]?.text || "Default";
+    const effortLabel = this.deepSeek ? "DeepSeek Harness default" : this.effortSelect.selectedOptions[0]?.text || "Effort: Default";
     this.modelMenuBtn.title = `Model: ${modelLabel}`;
     this.modelMenuBtn.setAttribute("aria-label", `Model: ${modelLabel}`);
     this.effortMenuBtn.title = effortLabel;

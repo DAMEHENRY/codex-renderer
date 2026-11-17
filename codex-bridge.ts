@@ -2,12 +2,14 @@
  * codex-bridge.ts — Spawn and manage Codex CLI child processes.
  *
  * Uses child_process.spawn to run `codex exec --json` and parse JSONL output.
- * No direct API calls. Official Codex CLI owns all session/state files.
+ * DeepSeek Harness owns its own fallback sessions. Both providers run as local CLIs.
  */
 
 import { spawn, exec, ChildProcess } from "child_process";
 import * as fs from "fs";
-import * as path from "path";
+import { createInterface } from "readline";
+import { runHarnessImageTurn } from "./deepseek-acp";
+import { prepareHarnessArgs, parseHarnessFinal, isCodexConnectionFailure, type HarnessFinalEvent } from "./deepseek-harness";
 import { forkBeforeMessage } from "./codex-session";
 import { type RewindMessage } from "./rewind-logic";
 import {
@@ -40,18 +42,25 @@ export interface CodexBridgeSettings {
   sandboxMode: string;
   approvalPolicy: string;
   requestTimeoutMinutes: number;
+  deepSeekFallback?: boolean;
+  deepSeekHarnessPath?: string;
 }
 
 export interface SendPromptOpts {
   prompt: string;
   sessionId?: string;   // undefined for new chat, UUID for resume
   imagePaths?: string[];
+  deepSeekSession?: boolean;
+  fallbackPrompt?: () => string;
+  owner?: object;       // the chat pane; each pane may run one request at a time
 }
 
 export interface CodexStreamEvent {
   type: "thread_started" | "text" | "error" | "done" | "turn_completed" | "cancelled" | "status" | "busy";
   content: string;
   threadId?: string;
+  deepSeek?: boolean;
+  connectionFailure?: boolean;
   usage?: {
     input_tokens?: number;
     cached_input_tokens?: number;
@@ -99,44 +108,64 @@ export function resolveCodexPath(configuredPath: string, env: NodeJS.ProcessEnv 
 /*  Process management                                                */
 /* ------------------------------------------------------------------ */
 
-let activeChild: ChildProcess | null = null;
+/**
+ * Running Codex children, keyed by the chat pane that owns them.
+ * Each pane can run its own request; two panes may not write the same session.
+ */
+interface ActiveRun { child: ChildProcess; sessionId?: string; cancelled?: boolean }
+const activeRuns = new Map<object, ActiveRun>();
+const GLOBAL_OWNER = {};
 
-export function killCodexProcess(): void {
-  if (!activeChild) return;
-  try {
-    activeChild.kill("SIGTERM");
-  } catch {
-    // ignore
-  }
-  // Force kill after 3 seconds if still alive
-  const child = activeChild;
-  setTimeout(() => {
-    try {
-      if (child && !child.killed) child.kill("SIGKILL");
-    } catch {
-      // ignore
-    }
+function killChild(child: ChildProcess): void {
+  if (child.killed || child.exitCode !== null || child.signalCode !== null) return;
+  child.kill("SIGTERM");
+  const force = setTimeout(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }, 3000);
-  activeChild = null;
+  child.once("close", () => clearTimeout(force));
 }
 
-export function isCodexRunning(): boolean {
-  return activeChild !== null;
+/** Kill the process owned by `owner`, or every process when no owner is given. */
+export function killCodexProcess(owner?: object): void {
+  if (owner === undefined) {
+    for (const run of activeRuns.values()) {
+      run.cancelled = true;
+      killChild(run.child);
+    }
+    return;
+  }
+  const run = activeRuns.get(owner);
+  if (!run) return;
+  run.cancelled = true;
+  killChild(run.child);
+}
+
+/** True when `owner` has a running process, or any pane does when no owner is given. */
+export function isCodexRunning(owner?: object): boolean {
+  return owner === undefined ? activeRuns.size > 0 : activeRuns.has(owner);
+}
+
+function isSessionRunning(sessionId: string | undefined): boolean {
+  if (!sessionId) return false;
+  for (const run of activeRuns.values()) if (run.sessionId === sessionId) return true;
+  return false;
 }
 
 export async function rewindConversation(
   codexCliPath: string, vaultRoot: string, sessionId: string,
-  messages: RewindMessage[], index: number,
+  messages: RewindMessage[], index: number, owner: object = GLOBAL_OWNER,
 ): Promise<string | null> {
-  if (activeChild) throw new Error("Wait for Codex to finish in all chat panes before rewinding.");
+  if (activeRuns.has(owner) || isSessionRunning(sessionId)) {
+    throw new Error("Wait for Codex to finish this conversation before rewinding.");
+  }
   try {
     return await forkBeforeMessage({
       executable: resolveCodexPath(codexCliPath), env: buildCodexChildEnv(),
       vaultRoot, sessionId, messages, index,
-      onSpawn: (child) => { activeChild = child; },
+      onSpawn: (child) => { activeRuns.set(owner, { child, sessionId }); },
     });
   } finally {
-    activeChild = null;
+    activeRuns.delete(owner);
   }
 }
 
@@ -146,18 +175,147 @@ export async function rewindConversation(
 
 /**
  * Spawn codex exec, write prompt to stdin, and yield parsed events.
- * Caller is responsible for only calling once at a time.
+ * Each owner may run one request at a time; different owners run in parallel.
  */
 export async function* sendPrompt(
   settings: CodexBridgeSettings,
   opts: SendPromptOpts,
   vaultRoot: string,
 ): AsyncGenerator<CodexStreamEvent> {
-  if (activeChild) {
-    yield { type: "busy", content: "Codex is still responding in another chat pane. Check its reply before retrying; this message was not sent." };
+  const owner = opts.owner ?? GLOBAL_OWNER;
+  if (activeRuns.has(owner)) {
+    yield { type: "busy", content: "Codex is still responding in this chat pane. Wait for its reply before retrying; this message was not sent." };
     yield { type: "done", content: "" };
     return;
   }
+  if (isSessionRunning(opts.sessionId)) {
+    yield { type: "busy", content: "This conversation is still running in another chat pane. Check its reply before retrying; this message was not sent." };
+    yield { type: "done", content: "" };
+    return;
+  }
+
+  if (opts.deepSeekSession) {
+    yield* sendDeepSeekPrompt(settings, opts, vaultRoot, false);
+    return;
+  }
+
+  const allowFallback = Boolean(settings.deepSeekFallback && settings.deepSeekHarnessPath);
+  const diagnostics: CodexStreamEvent[] = [];
+  for await (const event of sendCodexPrompt(settings, opts, vaultRoot, allowFallback)) {
+    if (allowFallback && (event.type === "error" || event.type === "status")) {
+      if (/^Reconnecting\.\.\./i.test(event.content)) {
+        yield { type: "status", content: event.content.split(" (")[0] };
+      } else {
+        diagnostics.push(event);
+      }
+      continue;
+    }
+    if (event.connectionFailure) {
+      for await (const fallbackEvent of sendDeepSeekPrompt(settings, opts, vaultRoot, true)) {
+        if (fallbackEvent.type === "error") yield* diagnostics;
+        yield fallbackEvent;
+      }
+      return;
+    }
+    if (event.type === "busy" || event.type === "cancelled") diagnostics.length = 0;
+    if (event.type === "done" && !event.threadId) yield* diagnostics;
+    yield event;
+  }
+}
+
+async function* sendDeepSeekPrompt(
+  settings: CodexBridgeSettings, opts: SendPromptOpts, vaultRoot: string, switching: boolean,
+): AsyncGenerator<CodexStreamEvent> {
+  const owner = opts.owner ?? GLOBAL_OWNER;
+  try {
+    if (!settings.deepSeekHarnessPath) throw new Error("DeepSeek Harness is unavailable on this computer.");
+    const executable = settings.deepSeekHarnessPath;
+    if (!fs.existsSync(executable)) throw new Error("DeepSeek Harness is unavailable on this computer.");
+    const prompt = switching ? opts.fallbackPrompt?.() ?? opts.prompt : opts.prompt;
+    const sessionId = switching ? undefined : opts.sessionId;
+    const images = opts.imagePaths ?? [];
+    const { args, cleanup, permission } = prepareHarnessArgs(settings.sandboxMode, sessionId, images.length > 0);
+    try {
+      const child = spawn(executable, args, {
+        cwd: vaultRoot, env: { ...buildCodexChildEnv(), DSH_PERMISSION_MODE: permission }, stdio: ["pipe", "pipe", "pipe"],
+      });
+      const run: ActiveRun = { child, sessionId: opts.sessionId };
+      activeRuns.set(owner, run);
+      const closed = new Promise<number | null>((resolve, reject) => {
+        child.once("close", resolve);
+        child.once("error", reject);
+      });
+      // The consumer can close this generator after the status event.
+      void closed.catch(() => {});
+
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr = (stderr + chunk).slice(-1000); });
+      child.stdin.on("error", () => {}); // Early failures are reported by the child.
+      const response = images.length
+        ? runHarnessImageTurn(child, vaultRoot, sessionId, prompt, images)
+        : (async () => {
+            let final: HarnessFinalEvent | undefined;
+            const lines = createInterface({ input: child.stdout });
+            lines.on("line", (line) => { final = parseHarnessFinal(line) ?? final; });
+            child.stdin.end(prompt);
+            const exitCode = await closed;
+            if (exitCode !== 0 || final?.reason.kind !== "completed" || !final.text.trim()) {
+              throw new Error(final?.reason.error?.message || stderr.trim() || "No reply received.");
+            }
+            return final;
+          })();
+      // The process can fail during the status yield.
+      void response.catch(() => {});
+
+      let timedOut = false;
+      const timeoutMs = settings.requestTimeoutMinutes * 60 * 1000;
+      const timeout = timeoutMs > 0 ? setTimeout(() => {
+        timedOut = true;
+        killChild(child);
+      }, timeoutMs) : undefined;
+      try {
+        yield {
+          type: "status",
+          content: switching ? "Codex connection failed. Trying DeepSeek Harness…" : "Thinking with DeepSeek Harness…",
+        };
+        let result;
+        try {
+          result = await response;
+          const exitCode = await closed;
+          if (exitCode !== 0) throw new Error(stderr.trim() || "Harness exited unexpectedly.");
+        } catch (error) {
+          if (!run.cancelled && !timedOut) throw error;
+        }
+        if (run.cancelled) {
+          yield { type: "cancelled", content: "Request was cancelled." };
+        } else if (timedOut) {
+          throw new Error("Request timed out.");
+        } else if (result) {
+          if (!result.sessionId || (sessionId && result.sessionId !== sessionId)) {
+            throw new Error("Harness returned an unexpected session ID.");
+          }
+          yield { type: "thread_started", content: "", threadId: result.sessionId, deepSeek: true };
+          yield { type: "text", content: result.text };
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (child.pid) killChild(child);
+        await closed.catch(() => {});
+        if (activeRuns.get(owner) === run) activeRuns.delete(owner);
+      }
+    } finally {
+      cleanup();
+    }
+  } catch (error) {
+    yield { type: "error", content: `DeepSeek Harness: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  yield { type: "done", content: "" };
+}
+
+async function* sendCodexPrompt(
+  settings: CodexBridgeSettings, opts: SendPromptOpts, vaultRoot: string, allowFallback: boolean,
+): AsyncGenerator<CodexStreamEvent> {
+  const owner = opts.owner ?? GLOBAL_OWNER;
 
   let codexPath: string;
   try {
@@ -180,7 +338,7 @@ export async function* sendPrompt(
 
   const timeoutMs = settings.requestTimeoutMinutes * 60 * 1000;
 
-  let child: ChildProcess;
+  let child;
   try {
     child = spawn(codexPath, args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -196,21 +354,11 @@ export async function* sendPrompt(
     return;
   }
 
-  activeChild = child;
-
-  // Write prompt to stdin and close
-  try {
-    child.stdin?.write(opts.prompt);
-    child.stdin?.end();
-  } catch (err) {
-    yield {
-      type: "error",
-      content: `Failed to write to Codex stdin: ${err instanceof Error ? err.message : String(err)}`,
-    };
-    killCodexProcess();
-    yield { type: "done", content: "" };
-    return;
-  }
+  const run: ActiveRun = { child, sessionId: opts.sessionId };
+  activeRuns.set(owner, run);
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  child.stdin.on("error", () => {}); // Early failures are reported by the child.
+  child.stdin.end(opts.prompt);
 
   // Track state for final classification
   let threadId = "";
@@ -220,6 +368,8 @@ export async function* sendPrompt(
   let errorMessage = "";
   let timedOut = false;
   let spawnFailed = false;
+  let codexStartedWork = false;
+  let modelConnectionFailed = false;
   let finalUsage: CodexStreamEvent["usage"];
 
   // Timeout guard
@@ -227,26 +377,15 @@ export async function* sendPrompt(
   if (timeoutMs > 0) {
     timeoutHandle = setTimeout(() => {
       timedOut = true;
-      killCodexProcess();
+      killChild(child);
     }, timeoutMs);
   }
 
   // Collect stderr for error reporting
   let stderrBuf = "";
-  child.stderr?.on("data", (chunk: Buffer) => {
-    stderrBuf += chunk.toString();
+  child.stderr?.setEncoding("utf8").on("data", (chunk: string) => {
+    stderrBuf = (stderrBuf + chunk).slice(-32_768);
   });
-
-  // Parse stdout JSONL line by line
-  let lineBuf = "";
-  const stdout = child.stdout;
-
-  if (!stdout) {
-    yield { type: "error", content: "No stdout from Codex CLI" };
-    yield { type: "done", content: "" };
-    activeChild = null;
-    return;
-  }
 
   // We need to yield events as they arrive from stdout.
   // Use a queue-based approach with a generator.
@@ -263,86 +402,62 @@ export async function* sendPrompt(
     }
   }
 
-  stdout.on("data", (chunk: Buffer) => {
-    lineBuf += chunk.toString();
-    const lines = lineBuf.split("\n");
-    lineBuf = lines.pop() || "";
+  function processLine(line: string): void {
+    const parsed = parseCodexJsonlLine(line);
+    if (!parsed) return;
+    if (parsed.type.startsWith("item.")) {
+      const item = parsed.raw.item as { type?: string } | undefined;
+      // Codex also emits diagnostic items during its own WebSocket-to-HTTPS retry.
+      if (item?.type !== "error") codexStartedWork = true;
+    }
+    switch (parsed.type) {
+      case "thread.started": {
+        const p = parsed as ThreadStartedEvent;
+        threadId = p.threadId;
+        hasThreadStarted = true;
+        pushEvent({ type: "thread_started", content: "", threadId });
+        break;
+      }
 
-    for (const line of lines) {
-      const parsed = parseCodexJsonlLine(line);
-      if (!parsed) continue;
-
-      switch (parsed.type) {
-        case "thread.started": {
-          const p = parsed as ThreadStartedEvent;
-          threadId = p.threadId;
-          hasThreadStarted = true;
-          pushEvent({ type: "thread_started", content: "", threadId });
-          break;
+      case "item.completed": {
+        const p = parsed as ItemCompletedEvent;
+        if (p.itemType === "agent_message" && p.text) {
+          pushEvent({ type: "text", content: p.text });
         }
+        break;
+      }
 
-        case "item.completed": {
-          const p = parsed as ItemCompletedEvent;
-          if (p.itemType === "agent_message" && p.text) {
-            pushEvent({ type: "text", content: p.text });
-          }
-          break;
-        }
+      case "turn.completed": {
+        const p = parsed as TurnCompletedEvent;
+        hasTurnCompleted = true;
+        finalUsage = p.usage;
+        pushEvent({
+          type: "turn_completed",
+          content: "",
+          usage: p.usage,
+        });
+        break;
+      }
 
-        case "turn.completed": {
-          const p = parsed as TurnCompletedEvent;
-          hasTurnCompleted = true;
-          finalUsage = p.usage;
-          pushEvent({
-            type: "turn_completed",
-            content: "",
-            usage: p.usage,
-          });
-          break;
-        }
-
-        case "error":
-        case "turn.failed": {
-          const p = parsed as ErrorEvent;
+      case "error":
+      case "turn.failed": {
+        const p = parsed as ErrorEvent;
+        if (isCodexConnectionFailure(p.message)) modelConnectionFailed = true;
+        if (!allowFallback || !/^Reconnecting\.\.\./i.test(p.message)) {
           hasError = true;
           errorMessage = p.message;
-          pushEvent({ type: "error", content: p.message });
-          break;
         }
-
-        // turn.started and other types: no-op
+        pushEvent({ type: "error", content: p.message });
+        break;
       }
-    }
-  });
 
-  stdout.on("end", () => {
-    // Process any remaining data in lineBuf
-    if (lineBuf.trim()) {
-      const parsed = parseCodexJsonlLine(lineBuf);
-      if (parsed) {
-        if (parsed.type === "thread.started") {
-          const p = parsed as ThreadStartedEvent;
-          threadId = p.threadId;
-          hasThreadStarted = true;
-          pushEvent({ type: "thread_started", content: "", threadId: p.threadId });
-        } else if (parsed.type === "item.completed") {
-          const p = parsed as ItemCompletedEvent;
-          if (p.itemType === "agent_message" && p.text) {
-            pushEvent({ type: "text", content: p.text });
-          }
-        } else if (parsed.type === "turn.completed") {
-          const p = parsed as TurnCompletedEvent;
-          hasTurnCompleted = true;
-          finalUsage = p.usage;
-          pushEvent({ type: "turn_completed", content: "", usage: p.usage });
-        } else if (parsed.type === "error" || parsed.type === "turn.failed") {
-          const p = parsed as ErrorEvent;
-          hasError = true;
-          errorMessage = p.message;
-          pushEvent({ type: "error", content: p.message });
-        }
-      }
+      // turn.started and other types: no-op
     }
+  }
+
+  const lines = createInterface({ input: child.stdout });
+  lines.on("line", processLine);
+  lines.on("close", () => {
     streamDone = true;
     if (resolveNext) {
       const r = resolveNext;
@@ -367,30 +482,28 @@ export async function* sendPrompt(
     }
   });
 
-  // Yield events as they arrive
-  while (true) {
-    if (eventQueue.length > 0) {
-      const evt = eventQueue.shift()!;
-      yield evt;
-      if (evt.type === "done") return;
-    } else if (streamDone) {
-      break;
-    } else {
-      await new Promise<void>((resolve) => {
-        resolveNext = resolve;
-      });
+  try {
+    // Yield events as they arrive
+    while (true) {
+      if (eventQueue.length > 0) {
+        const evt = eventQueue.shift()!;
+        yield evt;
+        if (evt.type === "done") return;
+      } else if (streamDone) {
+        break;
+      } else {
+        await new Promise<void>((resolve) => {
+          resolveNext = resolve;
+        });
+      }
     }
+    await closed;
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+    if (child.pid) killChild(child);
+    await closed;
+    if (activeRuns.get(owner) === run) activeRuns.delete(owner);
   }
-
-  // Wait for process to exit
-  await new Promise<void>((resolve) => {
-    child.on("close", () => resolve());
-    // If already exited, resolve immediately
-    if (child.exitCode !== null || child.killed) resolve();
-  });
-
-  if (timeoutHandle) clearTimeout(timeoutHandle);
-  activeChild = null;
 
   // Yield final status
   const status: FinalStatus = classifyFinalStatus({
@@ -404,9 +517,22 @@ export async function* sendPrompt(
     spawnFailed,
   });
 
+  if (run.cancelled) {
+    yield { type: "cancelled", content: "Request was cancelled." };
+    yield { type: "done", content: "" };
+    return;
+  }
+
   if (isThreadStoreConflict(`${stderrBuf}\n${errorMessage}`)) {
     yield { type: "busy", content: "This conversation is active in another Codex process. Check its latest reply, then retry after it finishes; this message was not sent." };
     yield { type: "done", content: "" };
+    return;
+  }
+
+  if (allowFallback && !codexStartedWork && !hasTurnCompleted &&
+      status !== "success" && status !== "cancelled" && !spawnFailed &&
+      modelConnectionFailed) {
+    yield { type: "done", content: "", connectionFailure: true };
     return;
   }
 

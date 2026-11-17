@@ -4,11 +4,11 @@ A thin Obsidian renderer UI for the official local [Codex CLI](https://github.co
 
 ## Design Philosophy
 
-- **Official local CLI integration**: Relies entirely on the official local Codex CLI tool which handles session state, execution sandboxing, and ChatGPT subscription-based authentication.
+- **Official local CLI integration**: Codex requests use the official local CLI for session state, execution sandboxing, and ChatGPT subscription authentication.
 - **Zero API keys**: The plugin requires no direct OpenAI/Anthropic API keys and does not provide setting options for adding keys.
-- **Single Source of Truth**: Codex session files are the official history source of truth. Official Codex CLI rollout files are under `~/.codex/sessions/`. The local `history.json` cache managed by the plugin is for Obsidian UI convenience only.
+- **Conversation history**: Codex CLI rollout files live under `~/.codex/sessions/`. DeepSeek Harness sessions live under `~/.dsh/sessions/`. The local `history.json` cache is for Obsidian UI convenience.
 - **Codex App History vs CLI**: Codex app sidebar/history may not show non-interactive `codex exec` runs.
-- **No Secondary Trace source**: Conversations executed via this plugin are registered under official Codex session files and can be processed by standard Vault scripts (e.g., `scripts/copilot.py writeback-ai-day`).
+- **Vault traces**: The standard vault importer reads Codex and DeepSeek Harness session files.
 
 ## Settings & CLI Argument Binding
 
@@ -19,6 +19,12 @@ A thin Obsidian renderer UI for the official local [Codex CLI](https://github.co
 - **Sandbox mode**: Defaults to `workspace-write` (passes `--sandbox workspace-write` to `codex exec`).
 - **Approval policy**: `codex exec` does not accept the top-level `--ask-for-approval` flag, so the renderer does not pass approval-policy arguments. It also never uses dangerous overrides like `--dangerously-bypass-approvals-and-sandbox`.
 - **Renderer environment parity**: When Obsidian is launched from the macOS GUI, its environment may omit the merged ChatGPT app, legacy Codex.app, Codex primary runtime, and Homebrew paths. The renderer searches and prepends both `/Applications/ChatGPT.app/Contents/Resources` and the legacy Codex.app location before spawning the CLI, while retaining the other common tool paths. Desktop-only app tools such as Browser, Chrome, Computer Use, and image generation remain desktop capabilities, not renderer-provided CLI tools.
+
+## DeepSeek Harness fallback
+
+Enable **DeepSeek Harness fallback** in the plugin settings on a Mac with DeepSeek Harness installed in Applications and signed in. A new chat starts with Codex. After a detected connection failure, the plugin tries DeepSeek once if Codex has produced no reply or tool activity. DeepSeek receives the current request, including its text attachments and PNG, JPEG, WebP or GIF images, and up to 24,000 characters of recent completed chat. The Harness still connects to DeepSeek online.
+
+Follow-ups use the DeepSeek session so it can retain context. Restart with **New Chat** to use Codex again, or open the original Codex chat in **History**. DeepSeek replies are labelled in the chat. **Rewind & edit** is available in Codex chats.
 
 ## Rewind and edit
 
