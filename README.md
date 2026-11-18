@@ -22,7 +22,7 @@ A thin Obsidian renderer UI for the official local [Codex CLI](https://github.co
 
 ## DeepSeek Harness fallback
 
-Enable **DeepSeek Harness fallback** in the plugin settings on a Mac with DeepSeek Harness installed in Applications and signed in. A new chat starts with Codex. After a detected connection failure, the plugin tries DeepSeek once if Codex has produced no reply or tool activity. DeepSeek receives the current request, including its text attachments and PNG, JPEG, WebP or GIF images, and up to 24,000 characters of recent completed chat. The Harness still connects to DeepSeek online.
+Enable **DeepSeek Harness fallback** in the plugin settings on a Mac with DeepSeek Harness installed in Applications and signed in. A new chat starts with Codex. After a detected connection failure or usage limit (including ChatGPT subscription caps), the plugin tries DeepSeek once if Codex has produced no reply or tool activity. DeepSeek receives the current request, including its text attachments and PNG, JPEG, WebP or GIF images, and up to 24,000 characters of recent completed chat. The Harness still connects to DeepSeek online.
 
 Follow-ups use the DeepSeek session so it can retain context. Restart with **New Chat** to use Codex again, or open the original Codex chat in **History**. DeepSeek replies are labelled in the chat. **Rewind & edit** is available in Codex chats.
 

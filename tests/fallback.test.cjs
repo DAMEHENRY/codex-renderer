@@ -12,7 +12,7 @@ function bundle(name) {
 }
 
 const { sendPrompt, killCodexProcess, isCodexRunning } = bundle("codex-bridge");
-const { buildHarnessHandoff, DEEPSEEK_HARNESS_PATH } = bundle("deepseek-harness");
+const { buildHarnessHandoff, isCodexUsageLimitFailure, DEEPSEEK_HARNESS_PATH } = bundle("deepseek-harness");
 const codex = path.join(temporary, "codex");
 const harness = path.join(temporary, "dsh");
 const emit = (event) => `console.log(${JSON.stringify(JSON.stringify(event))});`;
@@ -134,6 +134,48 @@ async function collect(options = {}, overrides = {}, onEvent = () => {}) {
   assert(unavailable.some(e => e.type === "error" && e.content.includes("workspace routing")));
   assert(unavailable.some(e => e.type === "error" && e.content.includes("DeepSeek Harness")));
 
+  const usageLimitMessage = "You've hit your usage limit. Try again later.";
+  const quotaFailures = [
+    failure(usageLimitMessage),
+    failure("You’ve hit your usage limit for this model. Switch to another model now."),
+    failure("Usage limit reached"),
+    failure("Quota exceeded. Check your plan and billing details."),
+    failure("Your workspace is out of credits."),
+    emit({ type: "turn.failed", error: { message: "Request rejected", code: "usage_limit_reached" } }),
+    emit({ type: "turn.failed", error: { message: "Request rejected", code: "quota_exceeded" } }),
+    emit({ type: "error", message: "Request rejected", code: "rate_limit_exceeded" }),
+  ];
+  for (const quotaFailure of quotaFailures) {
+    writeExecutable(codex, [thread, quotaFailure, "process.exitCode = 1;"].join("\n"));
+    const events = await collect({ fallbackPrompt: () => handoff });
+    assert.equal(events.filter(e => e.deepSeek).length, 1);
+    assert.equal(events.find(e => e.type === "text")?.content, handoff);
+    assert(events.some(e => e.type === "status" && e.content.includes("usage limit reached")));
+    assert.equal(events.some(e => e.type === "error"), false);
+  }
+  const quotaImage = await collect({ imagePaths: [imagePath] });
+  assert.equal(quotaImage.find(e => e.deepSeek)?.threadId, "session-image");
+  const quotaDisabled = await collect({}, { deepSeekFallback: false });
+  assert.equal(quotaDisabled.some(e => e.deepSeek), false);
+  assert(quotaDisabled.some(e => e.type === "error"));
+  const quotaCancelled = await collect({}, {}, (event, owner) => {
+    if (event.type === "thread_started") killCodexProcess(owner);
+  });
+  assert.equal(quotaCancelled.some(e => e.deepSeek), false);
+  assert(quotaCancelled.some(e => e.type === "cancelled"));
+  for (const activity of [tool, success[0]]) {
+    writeExecutable(codex, [thread, activity, failure(usageLimitMessage), "process.exitCode = 1;"].join("\n"));
+    const events = await collect();
+    assert.equal(events.some(e => e.deepSeek), false);
+    assert(events.some(e => e.type === "error"));
+  }
+  for (const unrelated of ["401 Unauthorized", "context_window_exceeded", "agent_limit_reached", "session_budget_exceeded", "429 from a tool endpoint"]) {
+    assert.equal(isCodexUsageLimitFailure(unrelated), false);
+    writeExecutable(codex, [thread, failure(unrelated), "process.exitCode = 1;"].join("\n"));
+    assert.equal((await collect()).some(e => e.deepSeek), false);
+  }
+  console.log("PASS: usage caps and quota codes trigger text/image fallback, with cancellation, disabled setting, prior activity, and unrelated errors guarded");
+
   writeExecutable(codex, [thread, retry, tool, failure(offline), "process.exitCode = 1;"].join("\n"));
   assert.equal((await collect()).some(e => e.deepSeek), false);
   writeExecutable(codex, [thread, failure("401 Unauthorized"), "process.exitCode = 1;"].join("\n"));
@@ -143,6 +185,18 @@ async function collect(options = {}, overrides = {}, onEvent = () => {}) {
   assert.equal(recovered.some(e => e.deepSeek || e.type === "error"), false);
   assert.equal(recovered.find(e => e.type === "text").content, "Codex reply");
   console.log("PASS: fallback, resume, image routing and format validation, disabled setting, cancellation, unavailable Harness, tool guard, authentication failure, and Codex recovery");
+
+  if (process.argv.includes("--live-quota")) {
+    writeExecutable(codex, [thread, failure(usageLimitMessage), "process.exitCode = 1;"].join("\n"));
+    const events = await collect(
+      { prompt: "Reply with exactly QUOTA_FALLBACK_OK. Do not use tools." },
+      { deepSeekHarnessPath: DEEPSEEK_HARNESS_PATH },
+    );
+    assert(events.some(e => e.deepSeek));
+    assert(events.some(e => e.type === "status" && e.content.includes("usage limit reached")));
+    assert.equal(events.find(e => e.type === "text")?.content.trim(), "QUOTA_FALLBACK_OK");
+    console.log("PASS: simulated Codex subscription limit falls back to the installed DeepSeek Harness");
+  }
 
   if (process.argv.includes("--live")) {
     writeExecutable(codex, [thread, retry, diagnostic, failure(offline), "process.exitCode = 1;"].join("\n"));

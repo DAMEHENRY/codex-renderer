@@ -9,7 +9,7 @@ import { spawn, exec, ChildProcess } from "child_process";
 import * as fs from "fs";
 import { createInterface } from "readline";
 import { runHarnessImageTurn } from "./deepseek-acp";
-import { prepareHarnessArgs, parseHarnessFinal, isCodexConnectionFailure, type HarnessFinalEvent } from "./deepseek-harness";
+import { prepareHarnessArgs, parseHarnessFinal, isCodexConnectionFailure, isCodexUsageLimitFailure, type HarnessFinalEvent } from "./deepseek-harness";
 import { forkBeforeMessage } from "./codex-session";
 import { type RewindMessage } from "./rewind-logic";
 import {
@@ -60,7 +60,7 @@ export interface CodexStreamEvent {
   content: string;
   threadId?: string;
   deepSeek?: boolean;
-  connectionFailure?: boolean;
+  fallbackReason?: "connection" | "usage-limit";
   usage?: {
     input_tokens?: number;
     cached_input_tokens?: number;
@@ -195,7 +195,7 @@ export async function* sendPrompt(
   }
 
   if (opts.deepSeekSession) {
-    yield* sendDeepSeekPrompt(settings, opts, vaultRoot, false);
+    yield* sendDeepSeekPrompt(settings, opts, vaultRoot);
     return;
   }
 
@@ -210,8 +210,8 @@ export async function* sendPrompt(
       }
       continue;
     }
-    if (event.connectionFailure) {
-      for await (const fallbackEvent of sendDeepSeekPrompt(settings, opts, vaultRoot, true)) {
+    if (event.fallbackReason) {
+      for await (const fallbackEvent of sendDeepSeekPrompt(settings, opts, vaultRoot, event.fallbackReason)) {
         if (fallbackEvent.type === "error") yield* diagnostics;
         yield fallbackEvent;
       }
@@ -224,15 +224,15 @@ export async function* sendPrompt(
 }
 
 async function* sendDeepSeekPrompt(
-  settings: CodexBridgeSettings, opts: SendPromptOpts, vaultRoot: string, switching: boolean,
+  settings: CodexBridgeSettings, opts: SendPromptOpts, vaultRoot: string, fallbackReason?: "connection" | "usage-limit",
 ): AsyncGenerator<CodexStreamEvent> {
   const owner = opts.owner ?? GLOBAL_OWNER;
   try {
     if (!settings.deepSeekHarnessPath) throw new Error("DeepSeek Harness is unavailable on this computer.");
     const executable = settings.deepSeekHarnessPath;
     if (!fs.existsSync(executable)) throw new Error("DeepSeek Harness is unavailable on this computer.");
-    const prompt = switching ? opts.fallbackPrompt?.() ?? opts.prompt : opts.prompt;
-    const sessionId = switching ? undefined : opts.sessionId;
+    const prompt = fallbackReason ? opts.fallbackPrompt?.() ?? opts.prompt : opts.prompt;
+    const sessionId = fallbackReason ? undefined : opts.sessionId;
     const images = opts.imagePaths ?? [];
     const { args, cleanup, permission } = prepareHarnessArgs(settings.sandboxMode, sessionId, images.length > 0);
     try {
@@ -276,7 +276,11 @@ async function* sendDeepSeekPrompt(
       try {
         yield {
           type: "status",
-          content: switching ? "Codex connection failed. Trying DeepSeek Harness…" : "Thinking with DeepSeek Harness…",
+          content: fallbackReason === "usage-limit"
+            ? "Codex usage limit reached. Trying DeepSeek Harness…"
+            : fallbackReason === "connection"
+              ? "Codex connection failed. Trying DeepSeek Harness…"
+              : "Thinking with DeepSeek Harness…",
         };
         let result;
         try {
@@ -369,7 +373,7 @@ async function* sendCodexPrompt(
   let timedOut = false;
   let spawnFailed = false;
   let codexStartedWork = false;
-  let modelConnectionFailed = false;
+  let fallbackReason: "connection" | "usage-limit" | undefined;
   let finalUsage: CodexStreamEvent["usage"];
 
   // Timeout guard
@@ -442,7 +446,11 @@ async function* sendCodexPrompt(
       case "error":
       case "turn.failed": {
         const p = parsed as ErrorEvent;
-        if (isCodexConnectionFailure(p.message)) modelConnectionFailed = true;
+        if (isCodexUsageLimitFailure(p.message + "\n" + JSON.stringify(p.raw))) {
+          fallbackReason = "usage-limit";
+        } else if (!fallbackReason && isCodexConnectionFailure(p.message)) {
+          fallbackReason = "connection";
+        }
         if (!allowFallback || !/^Reconnecting\.\.\./i.test(p.message)) {
           hasError = true;
           errorMessage = p.message;
@@ -531,8 +539,8 @@ async function* sendCodexPrompt(
 
   if (allowFallback && !codexStartedWork && !hasTurnCompleted &&
       status !== "success" && status !== "cancelled" && !spawnFailed &&
-      modelConnectionFailed) {
-    yield { type: "done", content: "", connectionFailure: true };
+      fallbackReason) {
+    yield { type: "done", content: "", fallbackReason };
     return;
   }
 
