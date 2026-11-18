@@ -682,7 +682,7 @@ class CodexRendererSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("DeepSeek Harness fallback")
-      .setDesc("On a Codex connection failure before any reply or tool run, send the request, supported images and recent chat text to your signed-in DeepSeek account. Follow-ups in that chat use DeepSeek.")
+      .setDesc("When Codex hits a connection failure or usage limit before any reply or tool run, send the request, supported images and recent chat text to your signed-in DeepSeek account. Follow-ups in that chat use DeepSeek.")
       .addToggle((toggle) => toggle
         .setValue(this.plugin.settings.deepSeekFallback)
         .onChange(async (value) => {

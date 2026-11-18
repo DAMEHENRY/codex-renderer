@@ -69,6 +69,11 @@ export function isCodexConnectionFailure(output: string): boolean {
   return /\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|EAI_AGAIN|ENOTFOUND)\b|dns (?:error|lookup failed)|(?:failed|unable) to (?:connect|resolve host)|connection (?:reset|refused|timed out|closed before)|network is unreachable|error sending request for url|stream disconnected before completion|workspace routing discovery failed|websocket (?:error|handshake failed)|\b(?:50[234])\s+(?:bad gateway|service unavailable|gateway timeout)\b/i.test(output);
 }
 
+/** Recognize model-service limit errors emitted by Codex, including ChatGPT subscription caps. */
+export function isCodexUsageLimitFailure(output: string): boolean {
+  return /\b(?:usage_limit_reached|rate_limit_exceeded|quota_exceeded|insufficient_quota)\b|\bhit your usage limit\b|\busage limit (?:reached|exceeded)\b|\bquota exceeded\b|\brate limit (?:reached|exceeded)\b|\bout of credits\b/i.test(output);
+}
+
 export function buildHarnessHandoff(
   messages: { role: string; displayContent: string; sendStatus: string }[],
   prompt: string,
